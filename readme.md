@@ -1,13 +1,66 @@
 # Copy an OCI VCN between regions
 
+## Quick start with Cloud Shell
+
+```bash
+git clone https://github.com/fatih-keles/tf-copy.git
+cd tf-copy
+cp .env.example .env
+nano .env
+```
+
+Set these values in `.env`:
+
+```dotenv
+SOURCE_REGION=me-dubai-1
+DESTINATION_REGION=me-abudhabi-1
+SOURCE_COMPARTMENT_OCID=ocid1.compartment.oc1..REPLACE_ME
+```
+
+Leave `OCI_PROFILE` blank. Leave `DESTINATION_COMPARTMENT_OCID` blank to use the
+same compartment. If the source compartment has multiple VCNs, also set
+`SOURCE_VCN_OCID`. Save with **Ctrl+O**, **Enter**, then exit with **Ctrl+X**.
+
+Export, review, and preview the deployment:
+
+```bash
+./export.sh
+./review.sh
+./run.sh plan
+```
+
+Check the CIDRs and resource counts. A fresh plan should show resources to add,
+with **0 changed and 0 destroyed**. Then deploy and verify:
+
+```bash
+./run.sh apply
+./run.sh check
+```
+
+`apply` runs without another confirmation. `check` should report **No changes**.
+Select the destination region and compartment in the OCI Console to see the
+copied VCN. Keep `.env` unchanged and preserve `.work/` while the network exists.
+
+When you want to delete the copied network and generated local files:
+
+```bash
+./cleanup.sh all
+# Review the destroy plan and type yes.
+```
+
+To test again after cleanup, repeat the export, review, plan, apply, and check
+commands. If you never applied, `./cleanup.sh local` removes just the local files.
+
+## Manual installation on Compute
+
 Export one VCN and its supported network configuration, review the inventory,
 and create a separate network in another OCI region using Terraform. Source and
 destination regions, compartments, and the OCI profile are configured in `.env`.
 Both regions must belong to the same tenancy and use the same OCI profile.
 
-## Requirements
+### Requirements
 
-- Bash, Python 3.10 or later, and Terraform 1.4 or later.
+- Git, Bash, Python 3.10 or later, and Terraform 1.4 or later.
 - OCI CLI with working API-key authentication in `~/.oci/config`, outside this
   repository. OCI CLI and Terraform use the same named profile in that file.
 - Access to read the source network and manage networking in the destination
@@ -20,12 +73,13 @@ Remote backends are not supported.
 Install the prerequisites using the official [OCI CLI guide](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm)
 and [Terraform guide](https://developer.hashicorp.com/terraform/install).
 
-## Configure
+### Configure
 
 ```bash
-cd /path/to/tf-copy
+git clone https://github.com/fatih-keles/tf-copy.git
+cd tf-copy
 cp .env.example .env
-# Edit .env for your tenancy, source, and destination.
+nano .env
 ```
 
 | Setting | Meaning |
@@ -42,7 +96,7 @@ cp .env.example .env
 Keep credentials in the OCI configuration file and key file, outside this
 repository. `.env` and all generated data under `.work/` are ignored by Git.
 
-## Export and review
+### Export and review
 
 ```bash
 ./export.sh
@@ -60,7 +114,7 @@ dependencies in `.work/export.json` before planning. Review also checks whether
 the snapshot is supported, but does not compare it with live OCI or prove
 connectivity. It does not change OCI resources.
 
-## Plan, apply, and check
+### Plan, apply, and check
 
 ```bash
 ./run.sh plan
@@ -88,7 +142,7 @@ Terraform state stays in `.work/destination/`, including after a failed or
 partially completed apply. Keep that directory to manage or destroy the created
 resources. Use a separate checkout for another independently managed copy.
 
-## Remove a copy or local files
+### Remove a copy or local files
 
 ```bash
 # Show a destroy plan, then type yes to delete tracked destination resources.
@@ -109,7 +163,7 @@ managed resources. Existing Terraform state is retained when destruction fails.
 For automation, `./cleanup.sh destroy --yes` and `./cleanup.sh all --yes` skip
 the confirmation after the destroy plan is generated and displayed.
 
-## Supported network scope
+### Supported network scope
 
 The copy includes the selected IPv4 VCN, regional IPv4 subnets, route tables,
 security lists, network security groups and their rules, DHCP options, and
@@ -139,7 +193,7 @@ Generated snapshots, configuration, plans, state, and logs contain infrastructur
 details and belong outside the shared repository. Review `git status` before
 publishing changes. Never delete state to start over while resources still exist.
 
-## Tests
+### Tests
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -148,5 +202,5 @@ bash -n export.sh review.sh run.sh cleanup.sh lib/common.sh
 
 The tests use synthetic inventory and mocked cloud commands. Export, review,
 Terraform validation, and planning were also checked against a live IPv4 VCN,
-and the workflow has been manually tested. Review the plan before applying it
-in your environment.
+and the API-key workflow has been manually tested. Review the plan before
+applying it in your environment.

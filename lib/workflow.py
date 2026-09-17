@@ -66,28 +66,51 @@ def settings():
     version = os.environ.get('OCI_PROVIDER_VERSION', '9.2.0').strip()
     if not re.fullmatch(r'\d+\.\d+\.\d+', version):
         raise ValueError('OCI_PROVIDER_VERSION must be an exact version, e.g. 9.2.0.')
-    profile = os.environ.get('OCI_PROFILE', 'DEFAULT').strip() or 'DEFAULT'
-    config_file = Path.home() / '.oci' / 'config'
+    cloud_shell = os.environ.get('OCI_CLI_AUTH', '').strip().lower() == 'instance_obo_user'
+    config_file = (Path(os.environ.get('OCI_CLI_CONFIG_FILE', '').strip() or '/etc/oci/config').expanduser()
+                   if cloud_shell else Path.home() / '.oci' / 'config')
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(config_file)
+    profile = os.environ.get('OCI_PROFILE', '').strip()
+    if not profile:
+        # Cloud Shell's active Console region may change between sessions. Use
+        # the source region's profile when available to keep deployment binding stable.
+        profile = ((source if source in parser else os.environ.get('OCI_CLI_PROFILE', '').strip())
+                   if cloud_shell else 'DEFAULT')
     if profile not in parser or not parser[profile].get('tenancy'):
-        raise ValueError(f'Configure API-key profile {profile!r} in {config_file}.')
-    return {
+        kind = 'Cloud Shell' if cloud_shell else 'API-key'
+        raise ValueError(f'Configure {kind} profile {profile!r} with a tenancy in {config_file}.')
+    config = {
         'source_region': source, 'destination_region': destination,
         'source_compartment_id': compartment,
         'destination_compartment_id': destination_compartment,
         'source_vcn_id': os.environ.get('SOURCE_VCN_OCID', '').strip(),
         'vcn_name': os.environ.get('DESTINATION_VCN_NAME', '').strip(),
-        'profile': profile, 'config_file': str(config_file.resolve()),
+        'profile': profile,
+        'config_file': str(config_file.absolute() if cloud_shell else config_file.resolve()),
         'tenancy_id': parser[profile]['tenancy'], 'provider_version': version,
     }
+    if cloud_shell:
+        token_file = (os.environ.get('OCI_CLI_DELEGATION_TOKEN_FILE', '').strip()
+                      or parser[profile].get('delegation_token_file', '').strip())
+        if not token_file:
+            raise ValueError('Cloud Shell delegation_token_file is missing; reopen Cloud Shell and try again.')
+        # Preserve a stable Cloud Shell symlink if its session target rotates.
+        token_path = Path(token_file).expanduser().absolute()
+        if not token_path.is_file() or not os.access(token_path, os.R_OK) or token_path.stat().st_size == 0:
+            raise ValueError('Cloud Shell delegation token file is unavailable; reopen Cloud Shell and try again.')
+        config.update(auth_type='instance_obo_user', delegation_token_file=str(token_path))
+    return config
 
 
 def destination_settings(config):
-    return {'region': config['destination_region'],
-            'compartment_id': config['destination_compartment_id'],
-            'profile': config['profile'], 'config_file': config['config_file'],
-            'provider_version': config['provider_version'], 'vcn_name': config['vcn_name']}
+    destination = {'region': config['destination_region'],
+                   'compartment_id': config['destination_compartment_id'],
+                   'profile': config['profile'], 'config_file': config['config_file'],
+                   'provider_version': config['provider_version'], 'vcn_name': config['vcn_name']}
+    if config.get('auth_type') == 'instance_obo_user':
+        destination.update(auth_type=config['auth_type'], delegation_token_file=config['delegation_token_file'])
+    return destination
 
 
 def check_paths():
@@ -99,7 +122,7 @@ def check_paths():
 def oci(config, region, *args):
     require_program('oci')
     cmd = ['oci', '--config-file', config['config_file'], '--profile', config['profile'],
-           '--auth', 'api_key', '--region', region, '--output', 'json', '--no-retry', *args]
+           '--auth', config.get('auth_type', 'api_key'), '--region', region, '--output', 'json', '--no-retry', *args]
     result = subprocess.run(cmd, text=True, capture_output=True)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or f'exit {result.returncode}'
@@ -222,6 +245,13 @@ def tf(config, *args, log=None, capture=False, allowed=(0,)):
     if workspace_file.exists() and workspace_file.read_text().strip() != 'default':
         raise ValueError('Select the default Terraform workspace before continuing.')
     env = dict(os.environ, TF_IN_AUTOMATION='1', OCI_CONFIG_FILE=config['config_file'])
+    if config.get('auth_type') == 'instance_obo_user':
+        # The OCI provider signs opc-obo-token and rereads this path per request.
+        # Pass only a path; never copy token contents into configuration or state.
+        env['TF_VAR_use_obo_token'] = 'true'
+        env['TF_VAR_obo_token_path'] = config['delegation_token_file']
+        for key in ('TF_VAR_obo_token', 'OCI_obo_token', 'obo_token'):
+            env.pop(key, None)
     for key in list(env):
         if key.startswith('TF_CLI_ARGS'):
             del env[key]

@@ -164,8 +164,8 @@ def build_config(inventory: dict, destination: dict) -> dict:
 
     Resource labels are deterministic hashes of source IDs, with IDs sorted for
     stable serialization. No source infrastructure ID is emitted as a target.
-    The provider reads the selected profile from ~/.oci/config; arbitrary config
-    file paths are not supported by the provider's profile implementation.
+    API-key profiles use ~/.oci/config. Cloud Shell uses instance principal
+    authentication with an OBO token path supplied by the workflow subprocess.
     """
     if not isinstance(inventory, dict) or not isinstance(destination, dict):
         _error("inventory and destination must be objects")
@@ -178,7 +178,13 @@ def build_config(inventory: dict, destination: dict) -> dict:
             _error(f"Unsupported network resources: {name}; no configuration generated")
     for field in ("region", "compartment_id", "profile", "config_file", "provider_version"):
         _string(_required(destination, field, "destination"), f"destination.{field}")
-    if Path(destination["config_file"]).expanduser().resolve() != (Path.home() / ".oci/config").resolve():
+    auth_type = destination.get("auth_type", "api_key")
+    if auth_type not in ("api_key", "instance_obo_user"):
+        _error("Unsupported authentication type")
+    cloud_shell = auth_type == "instance_obo_user"
+    if cloud_shell:
+        _string(_required(destination, "delegation_token_file", "Cloud Shell"), "delegation_token_file")
+    elif Path(destination["config_file"]).expanduser().resolve() != (Path.home() / ".oci/config").resolve():
         _error("OCI Terraform profiles require ~/.oci/config; custom config_file paths are not supported")
     if not re.fullmatch(r"\d+\.\d+\.\d+", destination["provider_version"]):
         _error("provider_version must be a pinned version such as 9.2.0")
@@ -510,6 +516,13 @@ def build_config(inventory: dict, destination: dict) -> dict:
             "nat_public_ips": {"value": {mappings["nat_gateways"][o["id"]][1]: reference("nat_gateways", o["id"], "nat_ip") for o in items["nat_gateways"]}},
         },
     }
+    if cloud_shell:
+        # Explicitly empty profile avoids the provider's ~/.oci/config lookup.
+        # The delegation token is supplied through provider environment variables.
+        config["provider"]["oci"] = {
+            "auth": "InstancePrincipal", "region": _literal(destination["region"]),
+            "config_file_profile": "",
+        }
     if used_services:
         config["data"] = {"oci_core_services": {"destination": {}}}
         config["locals"] = {"service_" + name: _expr('one([for service in data.oci_core_services.destination.services : service if can(regex(' + json.dumps(_SERVICE_PATTERNS[name]) + ', service.cidr_block))])') for name in sorted(used_services)}
