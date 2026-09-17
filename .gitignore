@@ -1,0 +1,25 @@
+# Local settings and generated network data.
+.env
+.env.*
+!.env.example
+.work/
+
+# Generated output from earlier versions of this workflow.
+.last-export
+oci-network-copy.*/
+abudhabi-network/
+
+# Terraform caches, state, and plans must remain local.
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/plan.json
+**/outputs.json
+**/preflight*.json
+**/crash.*.log
+**/*.log
+
+# Python caches.
+**/__pycache__/
+**/*.py[cod]
