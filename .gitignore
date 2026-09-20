@@ -23,3 +23,9 @@ abudhabi-network/
 # Python caches.
 **/__pycache__/
 **/*.py[cod]
+
+# debug data and error logs.
+**/debug.log
+**/error.log
+**/trace.log
+debug-data/**

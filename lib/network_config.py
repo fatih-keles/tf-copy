@@ -8,6 +8,7 @@ deliberately not copied.
 """
 
 from hashlib import sha256
+from copy import deepcopy
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 import json
@@ -159,8 +160,8 @@ def _port_range(value, context):
     return result
 
 
-def build_config(inventory: dict, destination: dict) -> dict:
-    """Return Terraform JSON, or raise NetworkConfigError before any deployment.
+def build_preparation(inventory: dict, destination: dict) -> tuple[dict, dict]:
+    """Return Terraform JSON and an offline manual-completion manifest.
 
     Resource labels are deterministic hashes of source IDs, with IDs sorted for
     stable serialization. No source infrastructure ID is emitted as a target.
@@ -169,15 +170,21 @@ def build_config(inventory: dict, destination: dict) -> dict:
     """
     if not isinstance(inventory, dict) or not isinstance(destination, dict):
         _error("inventory and destination must be objects")
+    prepare = _bool(destination.get("prepare_network_only", False), "prepare_network_only")
+    details = {
+        "private_ip_targets": [], "deferred_routes": [], "excluded_drg_routes": [],
+        "excluded_drg_attachments": [], "gateway_associations": [], "warnings": [],
+    }
     if inventory.get("schema_version") != 1:
         _error("Unsupported inventory schema_version; expected 1")
     for field in ("source_region", "compartment_id"):
         _string(_required(inventory, field, "inventory"), f"inventory.{field}")
     for name, values in (inventory.get("unsupported_resources") or {}).items():
-        if values:
+        if values and not (prepare and name == "drg_attachments"):
             _error(f"Unsupported network resources: {name}; no configuration generated")
     for field in ("region", "compartment_id", "profile", "config_file", "provider_version"):
         _string(_required(destination, field, "destination"), f"destination.{field}")
+    details["destination_region"] = destination["region"]
     auth_type = destination.get("auth_type", "api_key")
     if auth_type not in ("api_key", "instance_obo_user"):
         _error("Unsupported authentication type")
@@ -239,6 +246,38 @@ def build_config(inventory: dict, destination: dict) -> dict:
     if vcn.get("lifecycle-state", "AVAILABLE") != "AVAILABLE":
         _error("VCN is not AVAILABLE")
 
+    excluded_drgs = set()
+    if prepare:
+        attachments = (inventory.get("unsupported_resources") or {}).get("drg_attachments", [])
+        if not isinstance(attachments, list):
+            _error("drg_attachments must be an array")
+        attachment_ids = set()
+        for attachment in sorted(attachments, key=lambda obj: str(obj.get("id", "")) if isinstance(obj, dict) else ""):
+            if not isinstance(attachment, dict):
+                _error("DRG attachment must be an object")
+            attachment_id = _string(_required(attachment, "id", "DRG attachment"), "DRG attachment.id")
+            drg_id = _string(_required(attachment, "drg-id", "DRG attachment"), "DRG attachment.drg-id")
+            if not attachment_id.startswith("ocid1.drgattachment.") or not drg_id.startswith("ocid1.drg."):
+                _error("DRG attachment has an invalid attachment or DRG OCID")
+            if attachment_id in attachment_ids:
+                _error("Duplicate DRG attachment ID")
+            attachment_ids.add(attachment_id)
+            network = attachment.get("network-details") or {}
+            if not isinstance(network, dict) or network.get("type", "VCN") != "VCN":
+                _error("DRG attachment does not describe a VCN attachment")
+            attached_vcns = [x for x in (attachment.get("vcn-id"), network.get("id")) if x]
+            if not attached_vcns or any(x != vcn_id for x in attached_vcns):
+                _error("DRG attachment belongs to another VCN or has no VCN reference")
+            if attachment.get("lifecycle-state", "ATTACHED") != "ATTACHED":
+                _error("DRG attachment is not ATTACHED")
+            ingress_tables = [x for x in (attachment.get("route-table-id"), network.get("route-table-id")) if x]
+            if len(set(ingress_tables)) > 1 or any(x not in mappings["route_tables"] for x in ingress_tables):
+                _error("DRG attachment has conflicting or missing ingress route table references")
+            excluded_drgs.add(drg_id)
+            source_ids.update((attachment_id, drg_id))
+            source_ids.update(x for x in (attachment.get("drg-route-table-id"), attachment.get("export-drg-route-distribution-id")) if x)
+            details["excluded_drg_attachments"].append(deepcopy(attachment))
+
     def reference(group, source_id, attribute="id"):
         if source_id not in mappings[group]:
             _error(f"Missing referenced resource in {group}: {source_id!r}")
@@ -256,6 +295,117 @@ def build_config(inventory: dict, destination: dict) -> dict:
         else:
             result["vcn_id"] = vcn_ref
         return result
+
+    private_targets = {}
+    if prepare:
+        referenced_ips = set()
+        for table in items["route_tables"]:
+            for rule in _list(table, "route-rules", "route table"):
+                if not isinstance(rule, dict):
+                    _error("route rule: expected an object")
+                target = _string(_required(rule, "network-entity-id", "route rule"), "route target")
+                if target.startswith("ocid1.privateip."):
+                    referenced_ips.add(target)
+        records = inventory.get("private_ips", [])
+        if not isinstance(records, list):
+            _error("private_ips must be an array; re-export referenced private-IP details")
+        by_id = {}
+        for record in records:
+            if not isinstance(record, dict):
+                _error("private_ips: expected an object")
+            source_id = _string(_required(record, "id", "private IP"), "private IP.id")
+            if source_id in by_id:
+                _error("Duplicate private-IP detail ID")
+            by_id[source_id] = record
+        if referenced_ips - by_id.keys():
+            _error("Missing referenced private-IP details; re-export the source network before preparation")
+        subnets_by_id = {obj["id"]: obj for obj in items["subnets"]}
+        vlans_by_id = {}
+        if "route_target_vlans" in inventory:
+            for vlan in _list(inventory, "route_target_vlans", "inventory"):
+                if not isinstance(vlan, dict):
+                    _error("route_target_vlans: expected an object")
+                vlan_id = _string(_required(vlan, "id", "route target VLAN"), "route target VLAN.id")
+                if vlan_id in vlans_by_id:
+                    _error("Duplicate route-target VLAN ID")
+                vlans_by_id[vlan_id] = vlan
+        seen_addresses, seen_hostnames = set(), set()
+        for source_id in sorted(referenced_ips):
+            obj = by_id[source_id]
+            _fields(obj, _BASE | {
+                "availability-domain", "cidr-prefix-length", "hostname-label", "ip-address",
+                "ip-state", "ipv4-subnet-cidr-at-creation", "is-primary", "is-reserved",
+                "lifetime", "route-table-id", "subnet-id", "vlan-id", "vnic-id",
+            }, "private IP")
+            source_ids.add(source_id)
+            source_ids.update(obj[field] for field in ("vnic-id", "vlan-id", "route-table-id") if obj.get(field))
+            if obj.get("vcn-id") not in (None, vcn_id):
+                _error("Private-IP detail belongs to another VCN")
+            if obj.get("cidr-prefix-length") not in (None, 32):
+                _error("Private-IP CIDR allocations are unsupported; a single IPv4 address is required")
+            address = _string(_required(obj, "ip-address", "private IP"), "private IP.ip-address")
+            try:
+                parsed_ip = ip_address(address)
+            except ValueError:
+                _error("Private-IP detail has an invalid IPv4 address")
+            if parsed_ip.version != 4:
+                _error("IPv6 private-IP targets are unsupported")
+            if address in seen_addresses:
+                _error("Duplicate private-IP target address")
+            seen_addresses.add(address)
+            subnet_id, vlan_id = obj.get("subnet-id"), obj.get("vlan-id")
+            if bool(subnet_id) == bool(vlan_id):
+                _error("Private-IP detail must identify exactly one source subnet or VLAN")
+            entry = {
+                "source_id": source_id, "ip_address": address, "subnet_id": subnet_id,
+                "vlan_id": vlan_id, "terraform_label": None,
+            }
+            if vlan_id:
+                if not isinstance(vlan_id, str) or not vlan_id.startswith("ocid1.vlan."):
+                    _error("Private-IP detail has an invalid VLAN OCID")
+                if "route_target_vlans" in inventory:
+                    if vlan_id not in vlans_by_id:
+                        _error("Missing route-target VLAN details; re-export the source network")
+                    vlan = vlans_by_id[vlan_id]
+                    if _required(vlan, "vcn-id", "route target VLAN") != vcn_id:
+                        _error("Route-target VLAN belongs to another VCN")
+                    vlan_cidr = ip_network(_ipv4(_required(vlan, "cidr-block", "route target VLAN"), "route target VLAN"))
+                    if parsed_ip not in vlan_cidr:
+                        _error("Private-IP address is outside its source VLAN")
+                entry.update(status="manual_vlan", reason="VLAN-backed target: recreate the VMware/VLAN component and its private-IP target manually; no subnet reservation is created.")
+                details["warnings"].append("VLAN-backed private-IP targets and their routes require manual destination setup.")
+            else:
+                if subnet_id not in subnets_by_id:
+                    _error("Private-IP target subnet is missing from the copied VCN")
+                subnet = subnets_by_id[subnet_id]
+                network = ip_network(_ipv4(_required(subnet, "cidr-block", "private-IP subnet"), "private-IP subnet"))
+                if parsed_ip not in network or parsed_ip in (network.network_address, network.network_address + 1, network.broadcast_address):
+                    _error("Private-IP target address is outside its subnet or reserved for OCI")
+                if obj.get("ipv4-subnet-cidr-at-creation") not in (None, "", str(network)):
+                    _error("Private-IP creation CIDR does not match its source subnet")
+                label = _label("private", source_id)
+                body = _metadata(obj, destination["compartment_id"])
+                del body["compartment_id"]  # Computed from the subnet by OCI.
+                body.update(subnet_id=reference("subnets", subnet_id), ip_address=address, lifetime="RESERVED")
+                hostname = obj.get("hostname-label")
+                if hostname:
+                    if not isinstance(hostname, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,61}[A-Za-z0-9]|[A-Za-z]", hostname):
+                        _error("Private-IP hostname-label is invalid")
+                    hostname_key = (subnet_id, hostname.lower())
+                    if hostname_key in seen_hostnames:
+                        _error("Duplicate private-IP hostname in a subnet")
+                    seen_hostnames.add(hostname_key)
+                    body["hostname_label"] = _literal(hostname)
+                # Compute and appliance setup are deliberately owned by the customer.
+                # In v9.2.0 an empty configured vnic_id can otherwise detach a reserved IP.
+                body["lifecycle"] = {"ignore_changes": "all"}
+                resources.setdefault("oci_core_private_ip", {})[label] = body
+                entry.update(status="reserved", terraform_label=label, reason="Reserve this subnet IPv4 address only; assign the existing reservation to the destination appliance and complete its routes manually.")
+                if obj.get("route-table-id"):
+                    details["warnings"].append("Source private-IP route-table associations are not assigned to reservations; configure per-IP routing during manual appliance setup.")
+            private_targets[source_id] = entry
+            details["private_ip_targets"].append(entry)
+        details["warnings"] = sorted(set(details["warnings"]))
 
     services_by_id, services_by_cidr = {}, {}
     for service in _list(inventory, "services", "inventory"):
@@ -361,9 +511,20 @@ def build_config(inventory: dict, destination: dict) -> dict:
     gateway_categories = {}
     for group in ("internet_gateways", "nat_gateways", "service_gateways"):
         for obj in items[group]:
-            if obj.get("route-table-id"):
-                _error(f"{group}: gateway route-table-id / ingress routing is not supported")
             body = base(group, obj)
+            if obj.get("route-table-id"):
+                if not prepare or group != "internet_gateways":
+                    _error(f"{group}: gateway route-table-id / ingress routing is not supported")
+                ingress_id = obj["route-table-id"]
+                ingress_ref = reference("route_tables", ingress_id)
+                ingress = next(table for table in items["route_tables"] if table["id"] == ingress_id)
+                if _list(ingress, "route-rules", "gateway ingress route table"):
+                    _error(f"{group}: nonempty gateway ingress route tables require manual design; only originally empty tables can be preserved")
+                body["route_table_id"] = ingress_ref
+                details["gateway_associations"].append({
+                    "gateway_type": group, "gateway_name": obj.get("display-name", ""),
+                    "source_route_table_id": ingress_id, "action": "preserved_empty",
+                })
             if group == "internet_gateways":
                 body["enabled"] = _bool(_required(obj, "is-enabled", group), "internet gateway.is-enabled")
             elif group == "nat_gateways":
@@ -386,16 +547,18 @@ def build_config(inventory: dict, destination: dict) -> dict:
     for obj in items["route_tables"]:
         body = base("route_tables", obj)
         body["route_rules"] = []
-        for rule in _list(obj, "route-rules", "route table"):
+        deferred = False
+        for rule_index, rule in enumerate(_list(obj, "route-rules", "route table"), 1):
             _fields(rule, {"cidr-block", "destination", "destination-type", "network-entity-id", "description", "route-type"}, "route rule")
             route_type = rule.get("route-type") or "STATIC"
             if route_type != "STATIC":
                 _error(f"Unsupported route type {route_type!r}")
             source_target = _required(rule, "network-entity-id", "route rule")
             matching = [g for g in ("internet_gateways", "nat_gateways", "service_gateways") if source_target in mappings[g]]
-            if not matching:
+            special_target = prepare and (source_target in excluded_drgs or source_target in private_targets)
+            if not matching and not special_target:
                 _error(f"Unsupported route target {source_target!r}; only copied IGW, NAT and service gateways are supported (no DRG/LPG/private IP)")
-            target_group = matching[0]
+            target_group = matching[0] if matching else None
             dest_type = rule.get("destination-type") or "CIDR_BLOCK"
             dest = rule.get("destination") or rule.get("cidr-block")
             if rule.get("cidr-block") and rule.get("destination") and rule["cidr-block"] != rule["destination"]:
@@ -413,10 +576,30 @@ def build_config(inventory: dict, destination: dict) -> dict:
                 dest = converted
             else:
                 _error(f"Unsupported route destination type {dest_type!r}")
+            if special_target:
+                if rule.get("description") is not None and not isinstance(rule["description"], str):
+                    _error("Route description must be a string or null")
+                record = {
+                    "source_route_table_id": obj["id"], "route_table_name": obj.get("display-name", ""),
+                    "terraform_route_table_label": mappings["route_tables"][obj["id"]][1],
+                    "rule_index": rule_index, "source_target_id": source_target,
+                    "destination": dest, "destination_type": dest_type,
+                    "description": rule.get("description"),
+                }
+                if source_target in excluded_drgs:
+                    details["excluded_drg_routes"].append(record)
+                else:
+                    details["deferred_routes"].append(record)
+                    deferred = True
+                continue
             converted = {"destination": dest, "destination_type": dest_type, "network_entity_id": reference(target_group, source_target), "route_type": "STATIC"}
             if rule.get("description") is not None:
                 converted["description"] = _literal(rule["description"])
             body["route_rules"].append(converted)
+        if deferred:
+            # Once the customer completes appliance routing, Terraform must not
+            # erase those rules on a subsequent network preparation apply.
+            body["lifecycle"] = {"ignore_changes": ["route_rules"]}
         put("route_tables", obj, body)
 
     for obj in items["security_lists"]:
@@ -526,7 +709,24 @@ def build_config(inventory: dict, destination: dict) -> dict:
     if used_services:
         config["data"] = {"oci_core_services": {"destination": {}}}
         config["locals"] = {"service_" + name: _expr('one([for service in data.oci_core_services.destination.services : service if can(regex(' + json.dumps(_SERVICE_PATTERNS[name]) + ', service.cidr_block))])') for name in sorted(used_services)}
+    if prepare:
+        config["output"]["route_tables"] = {"value": {
+            mappings["route_tables"][obj["id"]][1]: {
+                "id": reference("route_tables", obj["id"]), "name": _literal(obj.get("display-name", "")),
+            } for obj in items["route_tables"]
+        }}
+        config["output"]["reserved_private_ips"] = {"value": {
+            target["terraform_label"]: {
+                "id": _expr(f"oci_core_private_ip.{target['terraform_label']}.id"),
+                "ip_address": target["ip_address"], "subnet_id": reference("subnets", target["subnet_id"]),
+            } for target in details["private_ip_targets"] if target["status"] == "reserved"
+        }}
     serialized = json.dumps(config)
     if any(source_id in serialized for source_id in source_ids):
         _error("A source resource ID remains in generated text (possibly a name or tag); remove the source reference before preparing")
-    return config
+    return config, details
+
+
+def build_config(inventory: dict, destination: dict) -> dict:
+    """Return Terraform JSON; preparation mode requires an explicit opt-in."""
+    return build_preparation(inventory, destination)[0]

@@ -14,7 +14,8 @@ import shutil
 import subprocess
 import sys
 
-from network_config import build_config
+from network_config import build_config, build_preparation
+from handoff import write_handoff
 
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / '.work'
@@ -90,6 +91,12 @@ def settings():
         'config_file': str(config_file.absolute() if cloud_shell else config_file.resolve()),
         'tenancy_id': parser[profile]['tenancy'], 'provider_version': version,
     }
+    preparation = os.environ.get('PREPARE_NETWORK_ONLY', '').strip().lower()
+    if preparation not in ('', 'true', 'false'):
+        raise ValueError('PREPARE_NETWORK_ONLY must be true or false.')
+    # Omit the false/default key so existing deployments keep their binding.
+    if preparation == 'true':
+        config['prepare_network_only'] = True
     if cloud_shell:
         token_file = (os.environ.get('OCI_CLI_DELEGATION_TOKEN_FILE', '').strip()
                       or parser[profile].get('delegation_token_file', '').strip())
@@ -110,6 +117,8 @@ def destination_settings(config):
                    'provider_version': config['provider_version'], 'vcn_name': config['vcn_name']}
     if config.get('auth_type') == 'instance_obo_user':
         destination.update(auth_type=config['auth_type'], delegation_token_file=config['delegation_token_file'])
+    if config.get('prepare_network_only'):
+        destination['prepare_network_only'] = True
     return destination
 
 
@@ -200,6 +209,31 @@ def export_network(config):
         'local_peering_gateways': list_network(config, region, 'local-peering-gateway', compartment, vcn['id']),
         'drg_attachments': list_network(config, region, 'drg-attachment', compartment, vcn['id']),
     }
+    # Route targets are identified by OCID, not by their destination CIDRs.
+    target_ids = sorted({rule['network-entity-id']
+                         for table in inventory['route_tables']
+                         for rule in table.get('route-rules', [])
+                         if config.get('prepare_network_only')
+                         and str(rule.get('network-entity-id', '')).startswith('ocid1.privateip.')})
+    inventory['private_ips'] = []
+    related = {'vnic': {}, 'vlan': {}}
+    for target_id in target_ids:
+        target = oci(config, region, 'network', 'private-ip', 'get', '--private-ip-id', target_id)
+        if not isinstance(target, dict) or target.get('id') != target_id:
+            raise ValueError(f'Private-IP lookup did not return requested target {target_id}.')
+        inventory['private_ips'].append(target)
+        for kind in related:
+            related_id = target.get(kind + '-id')
+            if related_id and related_id not in related[kind]:
+                obj = oci(config, region, 'network', kind, 'get', '--' + kind + '-id', related_id)
+                if not isinstance(obj, dict) or obj.get('id') != related_id:
+                    raise ValueError(f'{kind.upper()} lookup did not return requested object {related_id}.')
+                if obj.get('vcn-id') and obj['vcn-id'] != vcn['id']:
+                    raise ValueError(f'Private-IP target {kind} belongs to a different VCN.')
+                related[kind][related_id] = obj
+    inventory['route_target_vnics'] = [related['vnic'][key] for key in sorted(related['vnic'])]
+    inventory['route_target_vlans'] = [related['vlan'][key] for key in sorted(related['vlan'])]
+    print(f'  private-IP route targets: {len(target_ids)}', flush=True)
     write_json(INVENTORY, inventory)
     print(f'Export saved: {INVENTORY}\nNext: ./review.sh', flush=True)
 
@@ -219,7 +253,7 @@ def load_inventory(config):
 
 def review(config):
     inventory = load_inventory(config)
-    generated = build_config(inventory, destination_settings(config))
+    generated, details = configuration(config, inventory)
     counts = {kind: len(items) for kind, items in generated['resource'].items()}
     lines = [f'Source: {config["source_region"]} / {inventory["vcn"]["display-name"]}',
              f'Destination: {config["destination_region"]} / {config["vcn_name"] or inventory["vcn"]["display-name"]}',
@@ -228,13 +262,48 @@ def review(config):
              f'Prepared Terraform resource blocks: {sum(counts.values())}']
     lines += [f'  {kind}: {count}' for kind, count in sorted(counts.items())]
     lines += [f'  Subnet {s["display-name"]}: {s["cidr-block"]}' for s in inventory['subnets']]
-    lines += ['CIDRs and security rules are retained. VM private IPs are assigned later.',
+    if details is not None:
+        reservations = sum(target['status'] == 'reserved' for target in details['private_ip_targets'])
+        manual = sum(target['status'] == 'manual_vlan' for target in details['private_ip_targets'])
+        lines += [f'Network preparation: {reservations} private IPs to reserve; {manual} VLAN targets for manual setup.',
+                  f'DRG exclusions: {len(details["excluded_drg_attachments"])} attachments, {len(details["excluded_drg_routes"])} route rules.',
+                  f'Private-IP routes deferred: {len(details["deferred_routes"])}.',
+                  'Appliances and deferred routing must be completed manually before workload use.',
+                  'Missing specific routes can make traffic follow existing NAT/IGW defaults.',
+                  'Terraform checks exclude handed-off route rules and reserved-IP changes.']
+        if not BINDING.exists():
+            write_handoff(WORK, inventory, details)
+            lines += ['Manual handoff: .work/manual-routing.md, .csv and .json (destination IDs available after apply).']
+        else:
+            verify_binding(config)
+            lines += ['Use ./run.sh handoff to refresh the handoff with destination IDs.']
+    lines += ['CIDRs and security rules are retained.',
               'Matching CIDRs prevent direct peering of source and destination VCNs.',
-              'No workload instances, storage, existing public/private IP allocations or private DNS resources are copied.',
+              'Workload instances, storage, public IP allocations and private DNS resources are not copied.',
               'Preparation checks passed. Next: ./run.sh plan (OCI validates destination settings).']
     report = '\n'.join(lines) + '\n'
     (WORK / 'review.txt').write_text(report)
     print(report, end='')
+
+
+def configuration(config, inventory):
+    destination = destination_settings(config)
+    if config.get('prepare_network_only'):
+        return build_preparation(inventory, destination)
+    return build_config(inventory, destination), None
+
+
+def handoff(config, outputs=None):
+    if not config.get('prepare_network_only'):
+        raise ValueError('Manual handoff requires PREPARE_NETWORK_ONLY=true for this deployment.')
+    verify_binding(config)
+    inventory = load_inventory(config)
+    _, details = configuration(config, inventory)
+    if outputs is None:
+        outputs = json.loads(tf(config, 'output', '-json', capture=True))
+    write_handoff(WORK, inventory, details, outputs=outputs)
+    print('Manual appliance/routing instructions: .work/manual-routing.md, .csv and .json.')
+    print('The handoff describes pending work; it does not verify attachments or activate routes.')
 
 
 def tf(config, *args, log=None, capture=False, allowed=(0,)):
@@ -296,7 +365,7 @@ def prepare(config):
     if DEST.exists():
         raise ValueError('Unrecognized destination workspace; inspect it and use cleanup.sh local if empty.')
     inventory = load_inventory(config)
-    generated = build_config(inventory, destination_settings(config))
+    generated, details = configuration(config, inventory)
     name = config['vcn_name'] or inventory['vcn']['display-name']
     existing = list_network(config, config['destination_region'], 'vcn', config['destination_compartment_id'])
     if any(v.get('display-name') == name and v.get('lifecycle-state') != 'TERMINATED' for v in existing):
@@ -305,6 +374,8 @@ def prepare(config):
     write_json(DEST / 'main.tf.json', generated)
     write_json(BINDING, {'settings': config, 'inventory_sha256': digest(INVENTORY),
                         'configuration_sha256': digest(DEST / 'main.tf.json'), 'may_have_resources': False})
+    if details is not None:
+        write_handoff(WORK, inventory, details)
 
 
 def plan(config):
@@ -334,6 +405,35 @@ def apply(config):
     tf(config, 'apply', '-input=false', '-no-color', 'deploy.tfplan', log=DEST / 'apply.log')
     outputs = json.loads(tf(config, 'output', '-json', capture=True))
     write_json(DEST / 'outputs.json', outputs)
+    if config.get('prepare_network_only'):
+        handoff(config, outputs=outputs)
+
+
+def assert_reserved_ips_unassigned(config):
+    """Provider destruction detaches IPs; don't disrupt customer appliances."""
+    state = read_json(DEST / 'terraform.tfstate')
+    target_ids = set()
+    for resource in state.get('resources', []):
+        if resource.get('mode') == 'managed' and resource.get('type') == 'oci_core_private_ip':
+            for instance in resource.get('instances', []):
+                target_id = instance.get('attributes', {}).get('id')
+                if not target_id:
+                    raise ValueError('Reserved-IP state is incomplete; inspect it before cleanup.')
+                target_ids.add(target_id)
+    for target_id in sorted(target_ids):
+        try:
+            target = oci(config, config['destination_region'], 'network', 'private-ip', 'get',
+                         '--private-ip-id', target_id)
+        except ValueError as exc:
+            raise ValueError('Cannot verify a managed reserved IP before cleanup. Check destination '
+                             'read permissions. If the IP was deleted manually, reconcile Terraform '
+                             'state with a reviewed refresh-only plan before retrying; keep .work/. '
+                             f'OCI reported: {exc}') from exc
+        if not isinstance(target, dict) or target.get('id') != target_id:
+            raise ValueError('Could not verify a managed reserved IP before cleanup.')
+        if target.get('vnic-id') or target.get('ip-state') != 'AVAILABLE':
+            raise ValueError(f'Reserved private IP {target_id} is attached or unavailable. '
+                             'Unassign it from the customer appliance before cleanup; no resources were destroyed.')
 
 
 def destroy(config, yes=False):
@@ -352,6 +452,7 @@ def destroy(config, yes=False):
     if not state_has_resources(state):
         print('No managed resources remain in destination state.')
         return
+    assert_reserved_ips_unassigned(config)
     tf(config, 'init', '-input=false', '-no-color')
     tf(config, 'plan', '-destroy', '-input=false', '-no-color', '-out=destroy.tfplan', log=DEST / 'destroy-plan.log')
     data = json.loads(tf(config, 'show', '-json', 'destroy.tfplan', capture=True))
@@ -364,6 +465,8 @@ def destroy(config, yes=False):
             raise ValueError('Noninteractive destruction requires --yes.')
         if input('Type yes to apply the destroy plan: ').strip() != 'yes':
             raise ValueError('Destruction cancelled; state and files retained.')
+    # Recheck after planning/confirmation, in case an appliance was attached meanwhile.
+    assert_reserved_ips_unassigned(config)
     tf(config, 'apply', '-input=false', '-no-color', 'destroy.tfplan', log=DEST / 'destroy.log')
     if state_has_resources(state):
         raise ValueError('Managed resources remain; preserving state.')
@@ -389,7 +492,7 @@ def main():
     subs.add_parser('export', help='Read the selected source VCN into .work/export.json')
     subs.add_parser('review', help='Review local inventory and preparation checks')
     run = subs.add_parser('run', help='Prepare, plan, apply, or check the destination')
-    run.add_argument('action', nargs='?', choices=('plan', 'apply', 'check'), default='plan')
+    run.add_argument('action', nargs='?', choices=('plan', 'apply', 'check', 'handoff'), default='plan')
     cleanup = subs.add_parser('cleanup', help='Destroy tracked destination resources and/or remove generated files')
     cleanup.add_argument('action', choices=('destroy', 'local', 'all'))
     cleanup.add_argument('--yes', action='store_true', help='Apply the destroy plan without a prompt')
@@ -407,8 +510,13 @@ def main():
             plan(config)
         elif args.action == 'apply':
             apply(config)
+        elif args.action == 'handoff':
+            handoff(config)
         else:
             verify_binding(config)
+            if config.get('prepare_network_only'):
+                print('Check covers Terraform-managed network preparation only; '
+                      'manual routes, IP assignments and appliance connectivity are not verified.')
             return tf(config, 'plan', '-input=false', '-no-color', '-detailed-exitcode',
                       log=DEST / 'check.log', allowed=(0, 2))
     else:
