@@ -7,7 +7,7 @@ import stat
 import tempfile
 import unittest
 
-from lib.handoff import CSV_FIELDS, MANUAL, NOT_DEPLOYED, write_handoff
+from lib.handoff import CSV_FIELDS, MANUAL, NOT_DEPLOYED, UNKNOWN_IP, write_handoff
 
 
 def fixture():
@@ -18,11 +18,16 @@ def fixture():
     }
     targets = [
         {"source_id": "ocid1.privateip.oc1.source.fixtureone", "ip_address": "10.0.1.10", "subnet_id": subnet_id,
-         "vlan_id": None, "status": "reserved", "terraform_label": "ip_one", "reason": "Reserve the source target address."},
-        {"source_id": "ocid1.privateip.oc1.source.fixturetwo", "ip_address": "10.0.1.11", "subnet_id": subnet_id,
-         "vlan_id": None, "status": "reserved", "terraform_label": "ip_two", "reason": "Reserve the source target address."},
+         "vlan_id": None, "vnic_id": "ocid1.vnic.oc1.source.fixture", "status": "manual", "terraform_label": None,
+         "subnet_terraform_label": "subnet_one", "lookup_status": "found", "lookup_error": None,
+         "reason": "Manually create the source target address in the copied subnet."},
+        {"source_id": "ocid1.privateip.oc1.source.fixturetwo", "ip_address": None, "subnet_id": None,
+         "vlan_id": None, "vnic_id": None, "status": "manual", "terraform_label": None,
+         "subnet_terraform_label": None, "lookup_status": "unavailable", "lookup_error": "404 NotAuthorizedOrNotFound",
+         "reason": "Source metadata unavailable; resolve the numeric IP and destination target manually."},
         {"source_id": "ocid1.privateip.oc1.source.fixturevlan", "ip_address": "10.0.8.10", "subnet_id": None,
-         "vlan_id": "ocid1.vlan.oc1.source.fixture", "status": "manual_vlan", "terraform_label": None,
+         "vlan_id": "ocid1.vlan.oc1.source.fixture", "vnic_id": None, "status": "manual", "terraform_label": None,
+         "subnet_terraform_label": None, "lookup_status": "found", "lookup_error": None,
          "reason": "Source private IP belongs to a VLAN; destination provisioning is manual."},
     ]
     rules = []
@@ -48,9 +53,8 @@ def fixture():
         "route_tables": {"value": {
             f"route_{suffix}": {"id": f"ocid1.routetable.oc1.destination.fixture{suffix}", "name": f"route-{suffix}"}
             for suffix in ("one", "two")}},
-        "reserved_private_ips": {"value": {
-            "ip_one": {"id": "ocid1.privateip.oc1.destination.fixtureone", "ip_address": "10.0.1.10", "subnet_id": "ocid1.subnet.oc1.destination.fixture"},
-            "ip_two": {"id": "ocid1.privateip.oc1.destination.fixturetwo", "ip_address": "10.0.1.11", "subnet_id": "ocid1.subnet.oc1.destination.fixture"},
+        "subnets": {"value": {
+            "subnet_one": {"id": "ocid1.subnet.oc1.destination.fixture", "name": "destination-appliances", "cidr": "10.0.1.0/24"},
         }},
     }
     return inventory, details, outputs
@@ -85,29 +89,37 @@ class HandoffTests(unittest.TestCase):
             self.assertIsNone(machine["destination_route_table_id"])
             self.assertIsNone(machine["destination_target_private_ip_id"])
             self.assertEqual(row["destination_route_table_id"], NOT_DEPLOYED)
-            self.assertIn(row["destination_target_private_ip_id"], (NOT_DEPLOYED, MANUAL))
+            self.assertEqual(row["destination_target_private_ip_id"], MANUAL)
+            self.assertEqual(machine["target_status"], "manual")
         markdown = (self.directory / "manual-routing.md").read_text()
         self.assertIn("Pending private-IP route rules: **47**", markdown)
         self.assertIn("**NOT DEPLOYED:**", markdown)
 
-    def test_postapply_joins_destination_route_tables_and_reserved_target_ids(self):
+    def test_postapply_joins_route_tables_and_known_subnets_without_private_ip_outputs(self):
         report = self.render(deployed=True)
+        self.assertNotIn("reserved_private_ips", self.outputs)
         for rule in report["pending_routes"]:
             label = rule["terraform_route_table_label"]
             self.assertEqual(rule["destination_route_table_id"], self.outputs["route_tables"]["value"][label]["id"])
-            if rule["target_status"] == "reserved":
-                expected = self.outputs["reserved_private_ips"]["value"][rule["terraform_label"]]
-                self.assertEqual(rule["destination_target_private_ip_id"], expected["id"])
-                self.assertEqual(rule["destination_subnet_id"], expected["subnet_id"])
+            self.assertEqual(rule["destination_route_table_name"], self.outputs["route_tables"]["value"][label]["name"])
+            self.assertIsNone(rule["destination_target_private_ip_id"])
+            self.assertEqual(rule["resolution"], "manual_unresolved")
+            if rule["subnet_terraform_label"]:
+                expected = self.outputs["subnets"]["value"][rule["subnet_terraform_label"]]
+                self.assertEqual(rule["destination_subnet_id"], expected["id"])
+                self.assertEqual(rule["destination_subnet_name"], expected["name"])
+                self.assertEqual(rule["destination_subnet_cidr"], expected["cidr"])
                 self.assertEqual(rule["source_subnet_name"], "appliances")
                 self.assertEqual(rule["source_subnet_cidr"], "10.0.1.0/24")
-                self.assertEqual(rule["resolution"], "reserved_attachment_unverified")
+                self.assertEqual(rule["source_vnic_id"], "ocid1.vnic.oc1.source.fixture")
+            else:
+                self.assertIsNone(rule["destination_subnet_id"])
         self.assertEqual(json.loads((self.directory / "manual-routing.json").read_text()), report)
         self.assertTrue(report["deployment_outputs_available"])
 
     def test_vlan_targets_remain_unresolved_after_apply_with_no_fake_reservation(self):
         report = self.render(deployed=True)
-        manual = [row for row in report["pending_routes"] if row["target_status"] == "manual_vlan"]
+        manual = [row for row in report["pending_routes"] if row["source_vlan_id"]]
         self.assertEqual(len(manual), 15)
         for row in manual:
             self.assertEqual(row["resolution"], "manual_unresolved")
@@ -115,8 +127,27 @@ class HandoffTests(unittest.TestCase):
             self.assertIsNone(row["destination_subnet_id"])
             self.assertEqual(row["source_vlan_id"], "ocid1.vlan.oc1.source.fixture")
         _, rows = self.csv_rows()
-        self.assertTrue(all(r["destination_target_private_ip_id"] == MANUAL for r in rows if r["target_status"] == "manual_vlan"))
-        self.assertIn("No VLAN or private-IP reservation was created", (self.directory / "manual-routing.md").read_text())
+        self.assertTrue(all(r["destination_target_private_ip_id"] == MANUAL for r in rows))
+        self.assertIn("These scripts do not copy VLANs or allocate their addresses", (self.directory / "manual-routing.md").read_text())
+
+    def test_unknown_numeric_ip_is_explicit_without_losing_any_route(self):
+        report = self.render(deployed=True)
+        missing_id = self.details["private_ip_targets"][1]["source_id"]
+        missing = [row for row in report["pending_routes"] if row["source_target_private_ip_id"] == missing_id]
+        self.assertEqual(len(missing), 16)
+        for row in missing:
+            self.assertIsNone(row["target_ip_address"])
+            self.assertEqual(row["numeric_ip_status"], "could_not_be_determined")
+            self.assertEqual(row["lookup_status"], "unavailable")
+            self.assertEqual(row["lookup_error"], "404 NotAuthorizedOrNotFound")
+            self.assertIsNone(row["source_subnet_id"])
+            self.assertIsNone(row["source_vlan_id"])
+        _, rows = self.csv_rows()
+        self.assertTrue(all(row["target_ip_address"] == UNKNOWN_IP for row in rows if row["source_target_private_ip_id"] == missing_id))
+        markdown = (self.directory / "manual-routing.md").read_text()
+        self.assertIn(UNKNOWN_IP, markdown)
+        self.assertIn("404 NotAuthorizedOrNotFound", markdown)
+        self.assertEqual(len(report["pending_routes"]), len(self.details["deferred_routes"]))
 
     def test_csv_has_blank_customer_completion_columns_and_no_excluded_routes(self):
         self.render(deployed=True)
@@ -145,33 +176,35 @@ class HandoffTests(unittest.TestCase):
         self.assertNotIn("oci network route-table update", markdown)
         self.assertNotIn("terraform apply", markdown)
 
-    def test_instructions_specify_primary_vnic_reservation_and_cleanup_dependencies(self):
+    def test_instructions_require_manual_allocations_and_cleanup_dependencies(self):
         self.render(deployed=True)
         markdown = (self.directory / "manual-routing.md").read_text()
-        for fragment in ("existing destination private-IP OCID", "creating the VM's primary VNIC", "privateIpId",
-                         "lifecycle ignore_changes = all", "private-IP assignments or settings",
-                         "Remove the customer-managed appliances", "unassign their reserved private IPs",
-                         "Remove the manually added private-IP route rules", "before running ./cleanup.sh destroy",
-                         "Cleanup refuses destruction", "attached to a VNIC"):
+        for fragment in ("No private IPs are automatically allocated, reserved, or attached", "Manually allocate",
+                         "newly created destination private-IP OCID", "customer_target_private_ip_id",
+                         "private-IP assignments or settings", "customer-managed appliances, their VNICs",
+                         "Remove the manually added private-IP route rules", "before running ./cleanup.sh destroy"):
             self.assertIn(fragment, markdown)
+        for incorrect in ("privateIpId", "lifecycle ignore_changes = all", "Reserved addresses still need", "tracked reserved private IP"):
+            self.assertNotIn(incorrect, markdown)
         self.assertNotIn("association was preserved with pending", markdown)
 
     def test_incomplete_postapply_outputs_fail_without_overwriting_existing_report(self):
         self.render()
         before = {p.name: p.read_bytes() for p in self.directory.iterdir()}
         for changed in ({}, {"route_tables": self.outputs["route_tables"]},
-                        {"reserved_private_ips": self.outputs["reserved_private_ips"]}):
+                        {"subnets": self.outputs["subnets"]}):
             with self.subTest(outputs=changed):
                 with self.assertRaisesRegex(ValueError, "missing Terraform output"):
                     write_handoff(self.directory, self.inventory, self.details, changed)
                 self.assertEqual({p.name: p.read_bytes() for p in self.directory.iterdir()}, before)
 
-    def test_missing_labels_and_mismatched_reserved_addresses_fail_closed(self):
+    def test_missing_network_output_labels_or_inconsistent_subnet_mapping_fail_closed(self):
         for mutate in (
             lambda o: o["route_tables"]["value"].pop("route_two"),
-            lambda o: o["reserved_private_ips"]["value"].pop("ip_one"),
-            lambda o: o["reserved_private_ips"]["value"]["ip_one"].update(ip_address="10.0.1.99"),
-            lambda o: o["reserved_private_ips"]["value"]["ip_one"].pop("subnet_id"),
+            lambda o: o["subnets"]["value"].pop("subnet_one"),
+            lambda o: o["subnets"]["value"]["subnet_one"].update(cidr="10.0.99.0/24"),
+            lambda o: o["subnets"]["value"]["subnet_one"].pop("id"),
+            lambda o: o["route_tables"]["value"]["route_one"].pop("id"),
         ):
             with self.subTest(mutation=mutate):
                 outputs = deepcopy(self.outputs)
@@ -183,8 +216,7 @@ class HandoffTests(unittest.TestCase):
     def test_source_resource_ids_cannot_be_reported_as_destination_ids(self):
         for output_name, label, field, source_id in (
             ("route_tables", "route_one", "id", self.details["deferred_routes"][0]["source_route_table_id"]),
-            ("reserved_private_ips", "ip_one", "id", self.details["private_ip_targets"][0]["source_id"]),
-            ("reserved_private_ips", "ip_one", "subnet_id", self.details["private_ip_targets"][0]["subnet_id"]),
+            ("subnets", "subnet_one", "id", self.details["private_ip_targets"][0]["subnet_id"]),
         ):
             with self.subTest(field=field, output=output_name):
                 outputs = deepcopy(self.outputs)
@@ -192,12 +224,13 @@ class HandoffTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "equals its source ID"):
                     write_handoff(self.directory, self.inventory, self.details, outputs)
 
-    def test_unknown_duplicate_and_falsely_reserved_vlan_targets_are_rejected(self):
+    def test_unknown_duplicate_and_falsely_managed_targets_are_rejected(self):
         for mutate in (
             lambda d: d["private_ip_targets"].append(deepcopy(d["private_ip_targets"][0])),
             lambda d: d["deferred_routes"][0].update(source_target_id="ocid1.privateip.oc1.source.missing"),
             lambda d: d["private_ip_targets"][2].update(terraform_label="fake_reservation"),
             lambda d: d["deferred_routes"].append(deepcopy(d["deferred_routes"][0])),
+            lambda d: d["private_ip_targets"][0].update(status="reserved"),
         ):
             with self.subTest(mutation=mutate):
                 details = deepcopy(self.details)
@@ -208,10 +241,12 @@ class HandoffTests(unittest.TestCase):
     def test_source_text_is_preserved_in_json_and_escaped_for_markdown_and_csv(self):
         original = '=HYPERLINK("x") | <tag>\nsecond line'
         self.details["deferred_routes"][0]["description"] = original
+        self.details["private_ip_targets"][1]["lookup_error"] = original
         report = self.render()
         self.assertEqual(report["pending_routes"][0]["description"], original)
         _, rows = self.csv_rows()
         self.assertEqual(rows[0]["description"], "'" + original)
+        self.assertEqual(rows[1]["lookup_error"], "'" + original)
         markdown = (self.directory / "manual-routing.md").read_text()
         self.assertIn("&#124; &lt;tag&gt;<br>second line", markdown)
 
@@ -229,6 +264,41 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(report["pending_routes"], [])
         self.assertEqual(self.csv_rows()[1], [])
         self.assertIn("Pending private-IP route rules: **0**", (self.directory / "manual-routing.md").read_text())
+
+    def test_only_unknown_targets_need_no_subnets_output(self):
+        self.details["private_ip_targets"] = [self.details["private_ip_targets"][1]]
+        source_id = self.details["private_ip_targets"][0]["source_id"]
+        self.details["deferred_routes"] = [r for r in self.details["deferred_routes"] if r["source_target_id"] == source_id]
+        del self.outputs["subnets"]
+        report = self.render(deployed=True)
+        self.assertEqual(len(report["pending_routes"]), 16)
+        self.assertTrue(all(row["target_ip_address"] is None for row in report["pending_routes"]))
+
+    def test_unnamed_destination_resources_use_source_names_or_labels(self):
+        self.outputs["subnets"]["value"]["subnet_one"].pop("name")
+        self.outputs["route_tables"]["value"]["route_one"]["name"] = ""
+        self.outputs["route_tables"]["value"]["route_two"]["name"] = None
+        for rule in self.details["deferred_routes"]:
+            if rule["terraform_route_table_label"] == "route_two":
+                rule["route_table_name"] = ""
+        report = self.render(deployed=True)
+        self.assertEqual(report["private_ip_targets"][0]["destination_subnet_name"], "appliances")
+        self.assertEqual(report["pending_routes"][0]["destination_route_table_name"], "route-one")
+        self.assertEqual(report["pending_routes"][1]["destination_route_table_name"], "route_two")
+        self.inventory["subnets"][0]["display-name"] = None
+        report = self.render(deployed=True)
+        self.assertEqual(report["private_ip_targets"][0]["destination_subnet_name"], "subnet_one")
+
+    def test_partially_unavailable_metadata_preserves_independently_known_ip(self):
+        target = self.details["private_ip_targets"][0]
+        target.update(lookup_status="unavailable", lookup_error="VNIC metadata unavailable")
+        report = self.render(deployed=True)
+        row = report["private_ip_targets"][0]
+        self.assertEqual(row["target_ip_address"], "10.0.1.10")
+        self.assertEqual(row["numeric_ip_status"], "determined")
+        self.assertEqual(row["lookup_status"], "unavailable")
+        self.assertEqual(row["lookup_error"], "VNIC metadata unavailable")
+        self.assertEqual(row["destination_subnet_id"], "ocid1.subnet.oc1.destination.fixture")
 
 
 if __name__ == "__main__":

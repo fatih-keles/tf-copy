@@ -31,9 +31,9 @@ cat .work/manual-routing.md
 ./run.sh plan
 ```
 
-This mode prepares the supported network, reserves the IPv4 addresses used by
-supported private-IP route targets, and leaves appliance deployment and those
-routes for you to finish manually. DRG attachments and DRG routes are excluded.
+This mode prepares the supported network and leaves appliance deployment, target
+IP allocation, and all private-IP routes for you to finish manually. It does not
+reserve private IPs. DRG attachments and DRG routes are excluded.
 Check the CIDRs, resource counts, and manual-routing report. A fresh plan should
 show resources to add, with **0 changed and 0 destroyed**. Then deploy:
 
@@ -48,12 +48,12 @@ cat .work/manual-routing.md
 created destination OCIDs. `handoff` lets you regenerate it later. `check` should
 report **No changes** for Terraform-managed settings; it does not verify pending
 manual routes or forwarding. Follow [Complete manual routing](#complete-manual-routing)
-before using paths that depend on appliances. Keep `.env`, including
+before sending workload traffic through the copied network. Keep `.env`, including
 `PREPARE_NETWORK_ONLY`, unchanged and preserve `.work/` while the network exists.
 
 When you want to delete the copied network, first remove your manually deployed
-appliances, unassign the reserved private IPs, and remove the manual routes that
-reference them. Then remove the copied network and generated local files:
+appliances, their IP allocations, and the manual routes that reference them.
+Then remove the copied network and generated local files:
 
 ```bash
 ./cleanup.sh all
@@ -77,9 +77,9 @@ Both regions must belong to the same tenancy and use the same OCI profile.
   repository. OCI CLI and Terraform use the same named profile in that file.
 - Access to read the source network and manage networking in the destination
   compartment. The tenancy must be subscribed to the destination region.
-- In preparation mode, access to read private-IP records referenced by source
-  route rules, their VNIC/VLAN details, and to create reserved private IPs in the
-  destination subnets.
+- Access to read referenced private-IP records enriches the manual-routing
+  report. If a lookup fails, export continues with a warning and the report
+  marks that target's metadata unavailable.
 
 OCI provider `9.2.0` is the example version; the selected version is pinned in
 the generated Terraform configuration. These scripts use local Terraform state.
@@ -122,11 +122,12 @@ repository. `.env` and all generated data under `.work/` are ignored by Git.
 `export.sh` reads the selected VCN through OCI CLI and saves the network snapshot
 to `.work/export.json`. It does not create or change OCI resources. Discovery is
 limited to the selected source compartment and does not recurse into child
-compartments. In preparation mode it also reads private-IP records referenced
-by route rules and their VNIC/VLAN details. These referenced objects can be read
-by OCID across compartments; this is not recursive compartment discovery.
-The source snapshot is preserved; the copied configuration and
-manual-routing reports are generated separately.
+compartments. In preparation mode it tries one lookup per distinct private-IP
+route target to record its numeric IP address and subnet, VLAN, or VNIC IDs.
+It does not make additional VNIC or VLAN lookups. A failed target lookup produces
+a warning and an unavailable-metadata reason; it does not stop the export.
+The source snapshot is preserved; the copied configuration and manual-routing
+reports are generated separately.
 
 `review.sh` summarizes the exported inventory and writes `.work/review.txt`.
 Review the VCN, subnet CIDRs, security rules, route tables, and gateway
@@ -137,9 +138,13 @@ connectivity. It does not change OCI resources.
 With `PREPARE_NETWORK_ONLY=true`, review also generates
 `.work/manual-routing.md`, `.work/manual-routing.csv`, and
 `.work/manual-routing.json`. These list deferred private-IP routes and excluded
-DRG routes before deployment. Destination OCIDs are filled in after apply.
-Older exports without the referenced private-IP details must be exported again
-with `./export.sh` before planning this mode. Missing addresses are never guessed.
+DRG routes before deployment.
+Each deferred rule retains its CIDR, destination type, description, and source
+target OCID. The report includes the numeric source IP when found and a copied
+subnet mapping when known. Missing metadata is labelled unavailable with a
+reason; addresses are never guessed. After apply, destination route-table and
+known subnet OCIDs are filled in. The customer destination target OCID stays
+blank until you create the appliance's IP allocation and record it.
 
 ### Plan, apply, and check
 
@@ -159,17 +164,15 @@ resolved for the destination region.
 that the configuration and environment still match the saved plan. The first
 plan binds the workspace to its source snapshot and destination settings. Keep
 those settings, including `PREPARE_NETWORK_ONLY`, unchanged until cleanup; to
-use different settings, destroy and
-clean the existing workspace first, or use a separate checkout. Generated
-Terraform files are not intended for manual editing.
+use different settings, destroy and clean the existing workspace first, or use
+a separate checkout. Generated Terraform files are not intended for manual editing.
 
 `check` compares the managed destination network with the configuration. It exits
 with `0` when no changes are needed, `2` when differences exist, and `1` on error.
 In preparation mode, route tables with deferred rules give ownership of their
 entire rule list to the manual operator using Terraform `ignore_changes` on
 `route_rules`. **No changes does not validate those rule lists, complete the
-pending routes, audit customer-managed reserved-IP settings, or prove
-connectivity.**
+pending routes, audit customer appliances or IP allocations, or prove connectivity.**
 
 Terraform state stays in `.work/destination/`, including after a failed or
 partially completed apply. Keep that directory to manage or destroy the created
@@ -177,14 +180,10 @@ resources. Use a separate checkout for another independently managed copy.
 
 ### Complete manual routing
 
-With `PREPARE_NETWORK_ONLY=true`, apply creates reserved private IPs for supported
-targets in the copied subnets, keeping the source IPv4 addresses. It does not
-deploy appliances, attach those IPs to VNICs, or activate deferred private-IP
-routes. The report records VLAN targets as blocked manual work because this
-workflow cannot copy VLANs or reserve their addresses in a copied subnet.
-After creation, reservation attachment and lifecycle settings are managed by
-the customer so Terraform does not reset them during later operations. Verify
-those settings in OCI; `check` does not audit their readiness.
+With `PREPARE_NETWORK_ONLY=true`, all private-IP routes are deferred. Appliance
+VMs, their private-IP allocations, and route activation are customer-managed.
+The scripts create no target IP reservations. VLAN targets require a separate
+destination design because this workflow does not copy VLANs.
 
 After applying, regenerate and read the handoff:
 
@@ -194,29 +193,33 @@ cat .work/manual-routing.md
 ```
 
 `handoff` reads the current Terraform outputs and regenerates all three report
-formats. It does not change routing. Use the destination OCIDs in the report;
-source OCIDs identify the original resources only.
+formats. It does not change routing or discover customer-created target IPs.
+Use its destination route-table and subnet OCIDs for the copied network; source
+OCIDs identify the original resources only. Save a separate copy of your
+completed checklist because regeneration overwrites the report files.
 
-1. Resolve any blocked targets listed in the report. VLAN targets require a
-   separate customer design and are not ready for rule activation.
-2. Deploy the required appliance VMs in the destination. For each supported
-   reserved address, use the **existing destination private-IP OCID** from the
-   report when creating the VM's primary VNIC (`privateIpId` in
-   [CreateVnicDetails](https://docs.oracle.com/en-us/iaas/tools/java/latest/com/oracle/bmc/core/model/CreateVnicDetails.Builder.html#privateIpId(java.lang.String))).
-   Do not request a new allocation of the same IPv4 address. Configure the
-   appliance and its VNICs for the intended forwarding behavior.
+1. Resolve unavailable source metadata and VLAN targets using your source
+   network records. Confirm each appliance's intended destination subnet or
+   separately prepared VLAN before deploying it.
+2. Deploy the appliance VMs, allocate and attach their private IPs, and record
+   the **new destination private-IP OCIDs** in the report's customer columns.
+   Use the reported source IP addresses as reference information; the scripts
+   have not reserved them. Enable IP forwarding in each appliance and skip
+   source/destination checking on its routing VNICs. Configure security rules,
+   return routes, and next hops for the intended traffic.
 3. In the destination OCI Console, open each route table identified in the
    report and **add** the listed deferred private-IP rules using their actual
    destination target OCIDs. Preserve the rules already present in the table;
    do not replace its entire rule list. Add a rule only after its target is
    deployed, attached, and able to forward traffic. Excluded DRG rules require
    separately prepared destination connectivity.
-4. Test the intended traffic paths and appliance forwarding. Keep the completed
-   report with your deployment records.
+4. Test the intended traffic paths in both directions and verify appliance
+   forwarding before enabling workload traffic. Keep the completed report with
+   your deployment records.
 
 Forwarding through the appliances is unavailable until they and their manual
-rules are complete. Routes that remain through a NAT or internet gateway may
-send traffic along a different path in the meantime. A successful Terraform
+rules are complete. Existing NAT or internet-gateway defaults may bypass the
+intended appliances while the private-IP routes are absent. A successful Terraform
 apply or **No changes** check does not mean this network is fully ready.
 
 ### Remove a copy or local files
@@ -237,28 +240,34 @@ Terraform state. It does not discover resources to delete by name or remove the
 source VCN. `local` refuses to delete a workspace whose state still tracks
 managed resources. Existing Terraform state is retained when destruction fails.
 
-In preparation mode, cleanup checks the reserved private IPs in OCI and refuses
-destruction while any are attached to a VNIC. Remove the customer-managed
-appliances and unassign their reserved IPs, then remove the manually added routes
-that reference those IPs before running cleanup. Those manual route dependencies
-are outside Terraform's resource graph. The scripts do not destroy manually
-deployed workloads for you.
-
-If a reservation was deleted outside Terraform, cleanup may stop because it
-cannot verify that resource. First check read permissions and confirm the
-deletion, then reconcile the state using a reviewed Terraform refresh-only
-plan before retrying. Keep `.work/`; a failed lookup is not proof of deletion.
+Remove customer-managed appliances, IP allocations, and referencing manual
+routes before cleanup. These dependencies are outside Terraform's resource
+graph. Cleanup destroys the copied route tables, including their manual rules;
+the scripts do not remove customer-created workloads for you.
 
 For automation, `./cleanup.sh destroy --yes` and `./cleanup.sh all --yes` skip
 the confirmation after the destroy plan is generated and displayed.
+
+### Existing workspaces from the reservation version
+
+Earlier preparation versions created reserved private IPs. Keep that workspace's
+`.env`, generated configuration, and Terraform state intact, then clean it up
+before making a fresh preparation with this version. Existing reservations are
+not silently migrated, dropped from state, or deleted by an upgrade.
+
+For those legacy workspaces, remove the appliances, unassign the reserved IPs,
+and remove manual routes that reference them before running `./cleanup.sh all`.
+The existing cleanup guard still checks reservations in OCI and refuses to
+destroy an attached or unverified IP. If a reservation was deleted externally,
+check permissions and confirm the deletion, then reconcile state with a reviewed
+Terraform refresh-only plan before retrying. Keep `.work/` throughout recovery.
 
 ### Supported network scope
 
 The copy includes the selected IPv4 VCN, regional IPv4 subnets, route tables,
 security lists, network security groups and their rules, DHCP options, and
-supported internet, NAT, and service gateways. CIDRs are preserved. Private IPs
-are reserved only for supported referenced route targets when
-`PREPARE_NETWORK_ONLY=true`; other workload IP allocations are not copied.
+supported internet, NAT, and service gateways. CIDRs are preserved. Private-IP
+allocations are not copied or reserved.
 
 Compute instances, storage, public IP allocations, DRGs, peering,
 VPN/FastConnect, and custom DNS resources are outside this workflow. IPv6,
@@ -274,11 +283,12 @@ copied table. Other gateway ingress configurations remain unsupported.
 With `PREPARE_NETWORK_ONLY=false` or omitted, strict copy validation remains in
 effect: routes through DRGs, peering gateways, or workload private IPs fail
 preparation, as do gateway ingress route-table associations. No private-IP
-reservations or manual routing exceptions are introduced in that mode.
+route exceptions are introduced in that mode.
 
 With `PREPARE_NETWORK_ONLY=true`, DRG attachments and their routes are excluded,
-all private-IP routes are deferred, and unsupported VLAN private-IP targets are
-marked blocked in the handoff while the supported subnet network is prepared.
+and all private-IP routes are deferred regardless of whether their target
+metadata can be read. The report identifies VLAN targets and unavailable
+metadata for manual completion while the supported subnet network is prepared.
 Other unsupported configurations still fail. Service gateways support the
 regional **All Services** and **Object Storage** service categories. Defined
 tags are omitted; freeform tags are retained. NAT gateways receive new public

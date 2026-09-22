@@ -58,21 +58,25 @@ class NetworkPreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(NetworkConfigError, "boolean"):
             build_config(inventory, {**destination, "prepare_network_only": "false"})
 
-    def test_reservation_and_exact_manual_handoff_preserve_gateway_rules(self):
+    def test_manual_targets_and_exact_handoff_preserve_gateway_rules(self):
         before = deepcopy(self.inventory)
         config, details = self.build()
         self.assertEqual(self.inventory, before)
         self.assertEqual(build_config(self.inventory, self.destination), config)
         target = details["private_ip_targets"][0]
-        self.assertEqual(target["status"], "reserved")
+        self.assertEqual(target["status"], "manual")
+        self.assertEqual(target["lookup_status"], "found")
+        self.assertIsNone(target["lookup_error"])
         self.assertEqual(target["ip_address"], "10.0.1.10")
-        reservation = config["resource"]["oci_core_private_ip"][target["terraform_label"]]
-        self.assertEqual(reservation["lifetime"], "RESERVED")
-        self.assertEqual(reservation["lifecycle"], {"ignore_changes": "all"})
-        self.assertNotIn("vnic_id", reservation)
-        self.assertNotIn("compartment_id", reservation)
-        self.assertEqual(reservation["hostname_label"], "firewall")
-        self.assertTrue(reservation["subnet_id"].startswith("${oci_core_subnet."))
+        self.assertEqual(target["vnic_id"], self.inventory["private_ips"][0]["vnic-id"])
+        self.assertIsNone(target["terraform_label"])
+        self.assertNotIn("oci_core_private_ip", config["resource"])
+        self.assertNotIn("reserved_private_ips", config["output"])
+        subnet = config["output"]["subnets"]["value"][target["subnet_terraform_label"]]
+        self.assertEqual(subnet["name"], "private")
+        self.assertEqual(subnet["cidr"], "10.0.1.0/24")
+        self.assertTrue(subnet["id"].startswith("${oci_core_subnet."))
+        self.assertNotIn("subnet_details", config["output"])
         self.assertEqual(details["destination_region"], self.destination["region"])
         self.assertEqual(len(details["deferred_routes"]), 1)
         route = details["deferred_routes"][0]
@@ -87,7 +91,6 @@ class NetworkPreparationTests(unittest.TestCase):
         self.assertEqual(details["excluded_drg_routes"][0]["rule_index"], 4)
         self.assertEqual(details["excluded_drg_attachments"], self.inventory["unsupported_resources"]["drg_attachments"])
         self.assertIn(route["terraform_route_table_label"], config["output"]["route_tables"]["value"])
-        self.assertIn(target["terraform_label"], config["output"]["reserved_private_ips"]["value"])
         self.assertNotIn("oc1.source-region", json.dumps(config))
 
     def test_all_private_routes_deferred_even_when_only_rules_in_default_table(self):
@@ -98,9 +101,9 @@ class NetworkPreparationTests(unittest.TestCase):
         self.assertEqual(table["route_rules"], [])
         self.assertEqual(table["lifecycle"]["ignore_changes"], ["route_rules"])
         self.assertEqual(len(details["deferred_routes"]), 3)
-        self.assertEqual(len(config["resource"]["oci_core_private_ip"]), 1)
+        self.assertNotIn("oci_core_private_ip", config["resource"])
 
-    def test_missing_private_ip_export_fails_with_reexport_instruction(self):
+    def test_missing_private_ip_export_produces_manual_handoff_with_unknown_ip(self):
         for value in (None, []):
             with self.subTest(value=value):
                 self.inventory = preparation_inventory()
@@ -108,57 +111,105 @@ class NetworkPreparationTests(unittest.TestCase):
                     del self.inventory["private_ips"]
                 else:
                     self.inventory["private_ips"] = value
-                with self.assertRaisesRegex(NetworkConfigError, "re-export"):
-                    self.build()
+                rule = self.inventory["route_tables"][0]["route-rules"][2]
+                rule["description"] = "Firewall target might be 10.0.1.10"
+                config, details = self.build()
+                target = details["private_ip_targets"][0]
+                self.assertEqual(target["status"], "manual")
+                self.assertEqual(target["lookup_status"], "unavailable")
+                for field in ("ip_address", "subnet_id", "vlan_id", "vnic_id", "terraform_label", "subnet_terraform_label"):
+                    self.assertIsNone(target[field])
+                self.assertIn("missing", target["lookup_error"])
+                self.assertTrue(details["warnings"])
+                self.assertEqual(details["deferred_routes"][0]["description"], rule["description"])
+                self.assertEqual(details["deferred_routes"][0]["destination"], rule["destination"])
+                self.assertNotIn("oci_core_private_ip", config["resource"])
+
+    def test_failed_private_ip_lookup_retains_error_without_blocking_routes(self):
+        source_id = self.inventory["private_ips"][0]["id"]
+        self.inventory["private_ips"] = []
+        error = "GetPrivateIp returned 404 NotAuthorizedOrNotFound"
+        self.inventory["private_ip_lookup_errors"] = [{"id": source_id, "error": error}]
+        config, details = self.build()
+        target = details["private_ip_targets"][0]
+        self.assertEqual(target["lookup_error"], error)
+        self.assertEqual(target["lookup_status"], "unavailable")
+        self.assertIsNone(target["ip_address"])
+        self.assertIn(error, " ".join(details["warnings"]))
+        self.assertEqual(len(details["deferred_routes"]), 1)
+        self.assertNotIn("oci_core_private_ip", config["resource"])
 
     def test_vlan_target_is_manual_only_and_never_guessed_from_subnet(self):
         target = self.inventory["private_ips"][0]
         target.update({"subnet-id": None, "vlan-id": "ocid1.vlan.oc1.source-region.vmware", "vnic-id": None, "ip-address": "10.0.50.10"})
-        self.inventory["route_target_vlans"] = [{
-            "id": target["vlan-id"], "vcn-id": self.inventory["vcn"]["id"], "cidr-block": "10.0.50.0/24",
-        }]
         config, details = self.build()
         self.assertNotIn("oci_core_private_ip", config["resource"])
-        self.assertEqual(config["output"]["reserved_private_ips"]["value"], {})
-        self.assertEqual(details["private_ip_targets"][0]["status"], "manual_vlan")
+        self.assertNotIn("reserved_private_ips", config["output"])
+        self.assertEqual(details["private_ip_targets"][0]["status"], "manual")
+        self.assertEqual(details["private_ip_targets"][0]["lookup_status"], "found")
+        self.assertEqual(details["private_ip_targets"][0]["vlan_id"], target["vlan-id"])
         self.assertIsNone(details["private_ip_targets"][0]["terraform_label"])
+        self.assertIsNone(details["private_ip_targets"][0]["subnet_terraform_label"])
         self.assertEqual(len(details["deferred_routes"]), 1)
-        self.assertTrue(details["warnings"])
-        self.inventory["route_target_vlans"][0]["vcn-id"] = "wrong-vcn"
-        with self.assertRaisesRegex(NetworkConfigError, "another VCN"):
-            self.build()
 
-    def test_bad_private_ip_details_fail_closed(self):
+    def test_invalid_private_ip_metadata_warns_without_blocking_preparation(self):
         cases = [
-            ("ip-address", "10.0.2.10", "outside"),
-            ("ip-address", "10.0.1.0", "reserved for OCI"),
-            ("ip-address", "10.0.1.1", "reserved for OCI"),
-            ("ip-address", "10.0.1.255", "reserved for OCI"),
-            ("ip-address", "2001:db8::1", "IPv6"),
-            ("subnet-id", "missing", "subnet is missing"),
-            ("vlan-id", "ocid1.vlan.oc1.source-region.other", "exactly one"),
-            ("cidr-prefix-length", 24, "single IPv4"),
-            ("ipv4-subnet-cidr-at-creation", "10.0.2.0/24", "creation CIDR"),
-            ("future-field", "special", "unsupported populated"),
+            ("ip-address", None), ("ip-address", "not-an-address"),
+            ("ip-address", "10.0.1.10/32"), ("ip-address", 1234),
+            ("subnet-id", ["invalid"]), ("vnic-id", 42),
+            ("vlan-id", "ocid1.vlan.oc1.source-region.other"),
+            ("vcn-id", "ocid1.vcn.oc1.source-region.other"),
         ]
-        for key, value, message in cases:
+        for key, value in cases:
             with self.subTest(key=key, value=value):
                 self.inventory = preparation_inventory()
                 self.inventory["private_ips"][0][key] = value
-                with self.assertRaisesRegex(NetworkConfigError, message):
-                    self.build()
+                config, details = self.build()
+                target = details["private_ip_targets"][0]
+                self.assertEqual(target["lookup_status"], "unavailable")
+                self.assertTrue(target["lookup_error"])
+                self.assertTrue(details["warnings"])
+                self.assertEqual(len(details["deferred_routes"]), 1)
+                self.assertNotIn("oci_core_private_ip", config["resource"])
+                if key == "ip-address":
+                    self.assertIsNone(target["ip_address"])
 
-    def test_duplicate_private_ip_records_and_addresses_are_rejected(self):
+    def test_reporting_metadata_ignores_reservation_and_hostname_restrictions(self):
+        record = self.inventory["private_ips"][0]
+        record.update({"hostname-label": "not a valid reservation hostname", "cidr-prefix-length": 24,
+                       "future-field": "special", "ipv4-subnet-cidr-at-creation": "10.0.2.0/24"})
+        config, details = self.build()
+        self.assertEqual(details["private_ip_targets"][0]["lookup_status"], "found")
+        self.assertNotIn("oci_core_private_ip", config["resource"])
+        self.assertNotIn("special", json.dumps(config))
+
+    def test_subnet_mapping_requires_exact_source_id_never_ip_range_guessing(self):
+        self.inventory["private_ips"][0]["subnet-id"] = "ocid1.subnet.oc1.source-region.unexported"
+        _, details = self.build()
+        target = details["private_ip_targets"][0]
+        self.assertEqual(target["lookup_status"], "found")
+        self.assertEqual(target["ip_address"], "10.0.1.10")
+        self.assertIsNone(target["subnet_terraform_label"])
+
+    def test_duplicate_private_ip_records_are_unavailable_without_failing(self):
         self.inventory["private_ips"].append(deepcopy(self.inventory["private_ips"][0]))
-        with self.assertRaisesRegex(NetworkConfigError, "Duplicate private-IP detail ID"):
-            self.build()
+        _, details = self.build()
+        target = details["private_ip_targets"][0]
+        self.assertEqual(target["lookup_status"], "unavailable")
+        self.assertIsNone(target["ip_address"])
+        self.assertIn("duplicate", target["lookup_error"])
+
+    def test_duplicate_numeric_addresses_are_reported_without_reservation_conflicts(self):
+        self.inventory["private_ips"].append(deepcopy(self.inventory["private_ips"][0]))
         other = self.inventory["private_ips"][1]
         other["id"] += "second"
         self.inventory["route_tables"][0]["route-rules"].append({
             "destination": "10.40.0.0/16", "network-entity-id": other["id"],
         })
-        with self.assertRaisesRegex(NetworkConfigError, "Duplicate private-IP target address"):
-            self.build()
+        config, details = self.build()
+        self.assertEqual(len(details["private_ip_targets"]), 2)
+        self.assertTrue(all(target["lookup_status"] == "found" for target in details["private_ip_targets"]))
+        self.assertNotIn("oci_core_private_ip", config["resource"])
 
     def test_only_matching_vcn_drg_attachments_authorize_drg_omission(self):
         for mutation in ("other_vcn", "unknown_drg", "attachment_target", "lpg"):

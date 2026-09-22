@@ -6,6 +6,7 @@ import argparse
 import configparser
 from datetime import datetime, timezone
 import hashlib
+from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ WORK = ROOT / '.work'
 DEST = WORK / 'destination'
 INVENTORY = WORK / 'export.json'
 BINDING = WORK / 'deployment.json'
+PRIVATE_IP_MODE = 'manual_routes_v1'
 
 
 def read_json(path):
@@ -152,6 +154,18 @@ def list_network(config, region, group, compartment, vcn=None):
     return oci(config, region, *args)
 
 
+def lookup_error_message(exc):
+    """Keep optional lookup diagnostics useful without dumping the CLI traceback."""
+    detail = str(exc)
+    try:
+        error, _ = json.JSONDecoder().raw_decode(detail[detail.index('{'):])
+        if isinstance(error, dict) and error.get('code') and error.get('message'):
+            detail = f"{error['code']} (HTTP {error.get('status', 'unknown')}): {error['message']}"
+    except (ValueError, TypeError):
+        pass
+    return ' '.join(detail.split())[:600] or type(exc).__name__
+
+
 def state_has_resources(path):
     state = read_json(path)
     if not isinstance(state, dict) or 'resources' not in state:
@@ -216,24 +230,29 @@ def export_network(config):
                          if config.get('prepare_network_only')
                          and str(rule.get('network-entity-id', '')).startswith('ocid1.privateip.')})
     inventory['private_ips'] = []
-    related = {'vnic': {}, 'vlan': {}}
+    inventory['private_ip_lookup_errors'] = []
     for target_id in target_ids:
-        target = oci(config, region, 'network', 'private-ip', 'get', '--private-ip-id', target_id)
-        if not isinstance(target, dict) or target.get('id') != target_id:
-            raise ValueError(f'Private-IP lookup did not return requested target {target_id}.')
+        # Metadata is only for the manual handoff: it must not block the copy.
+        # The response already contains subnet/VLAN/VNIC IDs; no related GETs
+        # or private-IP reservations are needed for the supported network.
+        try:
+            target = oci(config, region, 'network', 'private-ip', 'get', '--private-ip-id', target_id)
+            if not isinstance(target, dict) or target.get('id') != target_id:
+                raise ValueError('Private-IP lookup did not return the requested target.')
+            address = target.get('ip-address')
+            if not isinstance(address, str):
+                raise ValueError('Private-IP lookup did not return a numeric IP address.')
+            ip_address(address)
+        except (ValueError, OSError) as exc:
+            error = lookup_error_message(exc)
+            inventory['private_ip_lookup_errors'].append({'id': target_id, 'error': error})
+            print(f'  Warning: Could not determine numeric IP for {target_id}: {error}. '
+                  'Routes retained for manual configuration.', flush=True)
+            continue
         inventory['private_ips'].append(target)
-        for kind in related:
-            related_id = target.get(kind + '-id')
-            if related_id and related_id not in related[kind]:
-                obj = oci(config, region, 'network', kind, 'get', '--' + kind + '-id', related_id)
-                if not isinstance(obj, dict) or obj.get('id') != related_id:
-                    raise ValueError(f'{kind.upper()} lookup did not return requested object {related_id}.')
-                if obj.get('vcn-id') and obj['vcn-id'] != vcn['id']:
-                    raise ValueError(f'Private-IP target {kind} belongs to a different VCN.')
-                related[kind][related_id] = obj
-    inventory['route_target_vnics'] = [related['vnic'][key] for key in sorted(related['vnic'])]
-    inventory['route_target_vlans'] = [related['vlan'][key] for key in sorted(related['vlan'])]
-    print(f'  private-IP route targets: {len(target_ids)}', flush=True)
+    print(f'  private-IP route targets: {len(target_ids)}; '
+          f'addresses found: {len(inventory["private_ips"])}; '
+          f'could not be determined: {len(inventory["private_ip_lookup_errors"])}', flush=True)
     write_json(INVENTORY, inventory)
     print(f'Export saved: {INVENTORY}\nNext: ./review.sh', flush=True)
 
@@ -252,6 +271,8 @@ def load_inventory(config):
 
 
 def review(config):
+    if BINDING.exists():
+        assert_manual_routing_workspace(config, verify_binding(config))
     inventory = load_inventory(config)
     generated, details = configuration(config, inventory)
     counts = {kind: len(items) for kind, items in generated['resource'].items()}
@@ -263,19 +284,19 @@ def review(config):
     lines += [f'  {kind}: {count}' for kind, count in sorted(counts.items())]
     lines += [f'  Subnet {s["display-name"]}: {s["cidr-block"]}' for s in inventory['subnets']]
     if details is not None:
-        reservations = sum(target['status'] == 'reserved' for target in details['private_ip_targets'])
-        manual = sum(target['status'] == 'manual_vlan' for target in details['private_ip_targets'])
-        lines += [f'Network preparation: {reservations} private IPs to reserve; {manual} VLAN targets for manual setup.',
+        targets = details['private_ip_targets']
+        unknown = sum(not target['ip_address'] for target in targets)
+        lines += [f'Network preparation: {len(targets)} private-IP targets for manual setup; no private IPs are reserved.',
+                  f'Target numeric addresses: {len(targets) - unknown} found; {unknown} could not be determined (see handoff).',
                   f'DRG exclusions: {len(details["excluded_drg_attachments"])} attachments, {len(details["excluded_drg_routes"])} route rules.',
                   f'Private-IP routes deferred: {len(details["deferred_routes"])}.',
                   'Appliances and deferred routing must be completed manually before workload use.',
                   'Missing specific routes can make traffic follow existing NAT/IGW defaults.',
-                  'Terraform checks exclude handed-off route rules and reserved-IP changes.']
+                  'Terraform checks exclude handed-off route rules and customer-managed private IPs.']
         if not BINDING.exists():
             write_handoff(WORK, inventory, details)
             lines += ['Manual handoff: .work/manual-routing.md, .csv and .json (destination IDs available after apply).']
         else:
-            verify_binding(config)
             lines += ['Use ./run.sh handoff to refresh the handoff with destination IDs.']
     lines += ['CIDRs and security rules are retained.',
               'Matching CIDRs prevent direct peering of source and destination VCNs.',
@@ -296,7 +317,7 @@ def configuration(config, inventory):
 def handoff(config, outputs=None):
     if not config.get('prepare_network_only'):
         raise ValueError('Manual handoff requires PREPARE_NETWORK_ONLY=true for this deployment.')
-    verify_binding(config)
+    assert_manual_routing_workspace(config, verify_binding(config))
     inventory = load_inventory(config)
     _, details = configuration(config, inventory)
     if outputs is None:
@@ -357,10 +378,20 @@ def verify_binding(config):
     return binding
 
 
+def assert_manual_routing_workspace(config, binding):
+    # Keep old configuration/state usable for explicit cleanup, but never
+    # apply an old reservation plan or label its report as manual-only.
+    if config.get('prepare_network_only') and binding.get('private_ip_mode') != PRIVATE_IP_MODE:
+        raise ValueError('This workspace was prepared by the earlier private-IP reservation workflow. '
+                         'Keep .work/ and its settings intact. Use ./cleanup.sh all when ready to '
+                         'remove that deployment, then export/review/plan again for manual routing. '
+                         'Existing state and saved plans have not been changed.')
+
+
 def prepare(config):
     check_paths()
     if BINDING.exists():
-        verify_binding(config)
+        assert_manual_routing_workspace(config, verify_binding(config))
         return
     if DEST.exists():
         raise ValueError('Unrecognized destination workspace; inspect it and use cleanup.sh local if empty.')
@@ -372,8 +403,11 @@ def prepare(config):
         raise ValueError(f'Destination already has VCN {name!r}. Set DESTINATION_VCN_NAME or restore its state; it will not be adopted.')
     DEST.mkdir(mode=0o700)
     write_json(DEST / 'main.tf.json', generated)
-    write_json(BINDING, {'settings': config, 'inventory_sha256': digest(INVENTORY),
-                        'configuration_sha256': digest(DEST / 'main.tf.json'), 'may_have_resources': False})
+    binding = {'settings': config, 'inventory_sha256': digest(INVENTORY),
+               'configuration_sha256': digest(DEST / 'main.tf.json'), 'may_have_resources': False}
+    if config.get('prepare_network_only'):
+        binding['private_ip_mode'] = PRIVATE_IP_MODE
+    write_json(BINDING, binding)
     if details is not None:
         write_handoff(WORK, inventory, details)
 
@@ -395,6 +429,7 @@ def plan(config):
 
 def apply(config):
     binding = verify_binding(config)
+    assert_manual_routing_workspace(config, binding)
     meta = read_json(DEST / 'plan-meta.json')
     if meta['binding'] != binding or meta['plan_sha256'] != digest(DEST / 'deploy.tfplan'):
         raise ValueError('Saved plan does not match this deployment. Run ./run.sh plan again.')

@@ -308,101 +308,82 @@ def build_preparation(inventory: dict, destination: dict) -> tuple[dict, dict]:
                     referenced_ips.add(target)
         records = inventory.get("private_ips", [])
         if not isinstance(records, list):
-            _error("private_ips must be an array; re-export referenced private-IP details")
-        by_id = {}
+            _error("private_ips must be an array")
+        errors = inventory.get("private_ip_lookup_errors", [])
+        if not isinstance(errors, list):
+            _error("private_ip_lookup_errors must be an array")
+        by_id, lookup_errors, invalid_ids = {}, {}, set()
         for record in records:
-            if not isinstance(record, dict):
-                _error("private_ips: expected an object")
-            source_id = _string(_required(record, "id", "private IP"), "private IP.id")
+            if not isinstance(record, dict) or not isinstance(record.get("id"), str) or not record["id"]:
+                details["warnings"].append("Invalid private-IP metadata entry could not be matched to a route target and was ignored.")
+                continue
+            source_id = record["id"]
             if source_id in by_id:
-                _error("Duplicate private-IP detail ID")
+                invalid_ids.add(source_id)
             by_id[source_id] = record
-        if referenced_ips - by_id.keys():
-            _error("Missing referenced private-IP details; re-export the source network before preparation")
-        subnets_by_id = {obj["id"]: obj for obj in items["subnets"]}
-        vlans_by_id = {}
-        if "route_target_vlans" in inventory:
-            for vlan in _list(inventory, "route_target_vlans", "inventory"):
-                if not isinstance(vlan, dict):
-                    _error("route_target_vlans: expected an object")
-                vlan_id = _string(_required(vlan, "id", "route target VLAN"), "route target VLAN.id")
-                if vlan_id in vlans_by_id:
-                    _error("Duplicate route-target VLAN ID")
-                vlans_by_id[vlan_id] = vlan
-        seen_addresses, seen_hostnames = set(), set()
+        for record in errors:
+            if not isinstance(record, dict) or not isinstance(record.get("id"), str) or not record["id"]:
+                details["warnings"].append("Invalid private-IP lookup error entry could not be matched to a route target and was ignored.")
+                continue
+            source_id = record["id"]
+            if source_id in lookup_errors or source_id in by_id:
+                invalid_ids.add(source_id)
+            message = record.get("error")
+            lookup_errors[source_id] = message if isinstance(message, str) and message else "Private-IP lookup failed without a valid error message."
         for source_id in sorted(referenced_ips):
-            obj = by_id[source_id]
-            _fields(obj, _BASE | {
-                "availability-domain", "cidr-prefix-length", "hostname-label", "ip-address",
-                "ip-state", "ipv4-subnet-cidr-at-creation", "is-primary", "is-reserved",
-                "lifetime", "route-table-id", "subnet-id", "vlan-id", "vnic-id",
-            }, "private IP")
             source_ids.add(source_id)
-            source_ids.update(obj[field] for field in ("vnic-id", "vlan-id", "route-table-id") if obj.get(field))
-            if obj.get("vcn-id") not in (None, vcn_id):
-                _error("Private-IP detail belongs to another VCN")
-            if obj.get("cidr-prefix-length") not in (None, 32):
-                _error("Private-IP CIDR allocations are unsupported; a single IPv4 address is required")
-            address = _string(_required(obj, "ip-address", "private IP"), "private IP.ip-address")
-            try:
-                parsed_ip = ip_address(address)
-            except ValueError:
-                _error("Private-IP detail has an invalid IPv4 address")
-            if parsed_ip.version != 4:
-                _error("IPv6 private-IP targets are unsupported")
-            if address in seen_addresses:
-                _error("Duplicate private-IP target address")
-            seen_addresses.add(address)
-            subnet_id, vlan_id = obj.get("subnet-id"), obj.get("vlan-id")
-            if bool(subnet_id) == bool(vlan_id):
-                _error("Private-IP detail must identify exactly one source subnet or VLAN")
+            obj = by_id.get(source_id)
             entry = {
-                "source_id": source_id, "ip_address": address, "subnet_id": subnet_id,
-                "vlan_id": vlan_id, "terraform_label": None,
+                "source_id": source_id, "ip_address": None, "subnet_id": None,
+                "vlan_id": None, "vnic_id": None, "terraform_label": None,
+                "subnet_terraform_label": None, "status": "manual",
+                "lookup_status": "unavailable", "lookup_error": None,
             }
-            if vlan_id:
-                if not isinstance(vlan_id, str) or not vlan_id.startswith("ocid1.vlan."):
-                    _error("Private-IP detail has an invalid VLAN OCID")
-                if "route_target_vlans" in inventory:
-                    if vlan_id not in vlans_by_id:
-                        _error("Missing route-target VLAN details; re-export the source network")
-                    vlan = vlans_by_id[vlan_id]
-                    if _required(vlan, "vcn-id", "route target VLAN") != vcn_id:
-                        _error("Route-target VLAN belongs to another VCN")
-                    vlan_cidr = ip_network(_ipv4(_required(vlan, "cidr-block", "route target VLAN"), "route target VLAN"))
-                    if parsed_ip not in vlan_cidr:
-                        _error("Private-IP address is outside its source VLAN")
-                entry.update(status="manual_vlan", reason="VLAN-backed target: recreate the VMware/VLAN component and its private-IP target manually; no subnet reservation is created.")
-                details["warnings"].append("VLAN-backed private-IP targets and their routes require manual destination setup.")
+            if source_id in invalid_ids:
+                entry["lookup_error"] = "Conflicting or duplicate private-IP lookup records; source details could not be determined reliably."
+            elif obj is None:
+                entry["lookup_error"] = lookup_errors.get(source_id, "Private-IP details are missing from this export; the source address and owner could not be determined.")
             else:
-                if subnet_id not in subnets_by_id:
-                    _error("Private-IP target subnet is missing from the copied VCN")
-                subnet = subnets_by_id[subnet_id]
-                network = ip_network(_ipv4(_required(subnet, "cidr-block", "private-IP subnet"), "private-IP subnet"))
-                if parsed_ip not in network or parsed_ip in (network.network_address, network.network_address + 1, network.broadcast_address):
-                    _error("Private-IP target address is outside its subnet or reserved for OCI")
-                if obj.get("ipv4-subnet-cidr-at-creation") not in (None, "", str(network)):
-                    _error("Private-IP creation CIDR does not match its source subnet")
-                label = _label("private", source_id)
-                body = _metadata(obj, destination["compartment_id"])
-                del body["compartment_id"]  # Computed from the subnet by OCI.
-                body.update(subnet_id=reference("subnets", subnet_id), ip_address=address, lifetime="RESERVED")
-                hostname = obj.get("hostname-label")
-                if hostname:
-                    if not isinstance(hostname, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,61}[A-Za-z0-9]|[A-Za-z]", hostname):
-                        _error("Private-IP hostname-label is invalid")
-                    hostname_key = (subnet_id, hostname.lower())
-                    if hostname_key in seen_hostnames:
-                        _error("Duplicate private-IP hostname in a subnet")
-                    seen_hostnames.add(hostname_key)
-                    body["hostname_label"] = _literal(hostname)
-                # Compute and appliance setup are deliberately owned by the customer.
-                # In v9.2.0 an empty configured vnic_id can otherwise detach a reserved IP.
-                body["lifecycle"] = {"ignore_changes": "all"}
-                resources.setdefault("oci_core_private_ip", {})[label] = body
-                entry.update(status="reserved", terraform_label=label, reason="Reserve this subnet IPv4 address only; assign the existing reservation to the destination appliance and complete its routes manually.")
+                invalid_fields = []
+                address = obj.get("ip-address")
+                try:
+                    if not isinstance(address, str):
+                        raise ValueError("not a string")
+                    entry["ip_address"] = str(ip_address(address))
+                except ValueError:
+                    invalid_fields.append("ip-address")
+                for field, kind in (("subnet-id", "subnet"), ("vlan-id", "vlan"), ("vnic-id", "vnic")):
+                    value = obj.get(field)
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and value.startswith(f"ocid1.{kind}."):
+                        entry[field.replace("-", "_")] = value
+                        source_ids.add(value)
+                    else:
+                        invalid_fields.append(field)
+                if entry["subnet_id"] and entry["vlan_id"]:
+                    invalid_fields.append("conflicting subnet-id and vlan-id")
+                    entry["subnet_id"] = entry["vlan_id"] = None
+                if obj.get("vcn-id") not in (None, vcn_id):
+                    invalid_fields.append("vcn-id")
+                    entry["subnet_id"] = entry["vlan_id"] = entry["vnic_id"] = None
+                if invalid_fields:
+                    entry["lookup_error"] = "Private-IP metadata has missing or invalid fields: " + ", ".join(invalid_fields) + "."
+                else:
+                    entry["lookup_status"] = "found"
                 if obj.get("route-table-id"):
-                    details["warnings"].append("Source private-IP route-table associations are not assigned to reservations; configure per-IP routing during manual appliance setup.")
+                    details["warnings"].append("Source private-IP route-table associations require manual per-IP routing configuration during appliance setup.")
+                    if isinstance(obj["route-table-id"], str) and obj["route-table-id"].startswith("ocid1."):
+                        source_ids.add(obj["route-table-id"])
+            if entry["subnet_id"] in mappings["subnets"]:
+                entry["subnet_terraform_label"] = mappings["subnets"][entry["subnet_id"]][1]
+            if entry["lookup_status"] == "unavailable":
+                details["warnings"].append(f"Private-IP target {source_id}: details unavailable. {entry['lookup_error']}")
+                entry["reason"] = "Source details could not be fully determined. Identify the destination appliance and its private IP manually before completing these routes."
+            elif entry["vlan_id"]:
+                entry["reason"] = "VLAN-backed target: recreate the VMware/VLAN component and its private IP manually, then complete routes using the new private-IP OCID."
+            else:
+                entry["reason"] = "Create and configure the destination appliance and its private IP manually, then complete routes using the new private-IP OCID."
             private_targets[source_id] = entry
             details["private_ip_targets"].append(entry)
         details["warnings"] = sorted(set(details["warnings"]))
@@ -714,12 +695,6 @@ def build_preparation(inventory: dict, destination: dict) -> tuple[dict, dict]:
             mappings["route_tables"][obj["id"]][1]: {
                 "id": reference("route_tables", obj["id"]), "name": _literal(obj.get("display-name", "")),
             } for obj in items["route_tables"]
-        }}
-        config["output"]["reserved_private_ips"] = {"value": {
-            target["terraform_label"]: {
-                "id": _expr(f"oci_core_private_ip.{target['terraform_label']}.id"),
-                "ip_address": target["ip_address"], "subnet_id": reference("subnets", target["subnet_id"]),
-            } for target in details["private_ip_targets"] if target["status"] == "reserved"
         }}
     serialized = json.dumps(config)
     if any(source_id in serialized for source_id in source_ids):

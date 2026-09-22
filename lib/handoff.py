@@ -12,14 +12,17 @@ from collections import OrderedDict
 
 NOT_DEPLOYED = "NOT DEPLOYED"
 MANUAL = "MANUAL / UNRESOLVED"
+UNKNOWN_IP = "COULD NOT BE DETERMINED"
 
 CSV_FIELDS = (
     "source_route_table_name", "source_route_table_id", "terraform_route_table_label",
-    "destination_route_table_id", "source_rule_index", "destination", "destination_type",
+    "destination_route_table_id", "destination_route_table_name", "source_rule_index", "destination", "destination_type",
     "description", "source_target_private_ip_id", "target_ip_address",
-    "source_subnet_id", "source_subnet_name", "source_subnet_cidr", "source_vlan_id",
-    "destination_subnet_id", "destination_target_private_ip_id", "target_status", "reason",
-    "customer_vm_name", "customer_vnic_id", "customer_target_private_ip_id",
+    "numeric_ip_status", "lookup_status", "lookup_error",
+    "source_subnet_id", "source_subnet_name", "source_subnet_cidr", "source_vlan_id", "source_vnic_id",
+    "destination_subnet_id", "destination_subnet_name", "destination_subnet_cidr",
+    "destination_target_private_ip_id", "target_status", "reason",
+    "customer_vm_name", "customer_vnic_id", "customer_ip_address", "customer_subnet_id", "customer_target_private_ip_id",
     "customer_forwarding_verified", "customer_skip_source_dest_check_verified",
     "customer_rule_added", "customer_connectivity_verified", "customer_completed_at",
     "customer_notes",
@@ -71,7 +74,7 @@ def _csv_value(value):
 
 def _target_rows(inventory, details, outputs):
     targets = details.get("private_ip_targets", [])
-    reservations = _output_map(outputs, "reserved_private_ips", any(t.get("status") == "reserved" for t in targets))
+    destination_subnets = _output_map(outputs, "subnets", any(t.get("subnet_terraform_label") for t in targets))
     subnets = {s["id"]: s for s in inventory.get("subnets", [])}
     rows = OrderedDict()
     for target in targets:
@@ -79,38 +82,47 @@ def _target_rows(inventory, details, outputs):
         if source_id in rows:
             raise ValueError(f"Manual routing handoff: duplicate source target {source_id}.")
         status = target.get("status")
-        if status not in ("reserved", "manual_vlan"):
+        if status != "manual":
             raise ValueError(f"Manual routing handoff: unsupported target status {status!r}.")
-        ip_address = _required_text(target.get("ip_address"), "target IP address")
+        if target.get("terraform_label"):
+            raise ValueError("Manual routing handoff: manual targets must not claim a Terraform private-IP resource.")
+        ip_address = target.get("ip_address") or None
+        if ip_address is not None:
+            _required_text(ip_address, "target IP address")
+        lookup_status = target.get("lookup_status")
+        if lookup_status not in ("found", "unavailable"):
+            raise ValueError(f"Manual routing handoff: unsupported lookup status {lookup_status!r}.")
         subnet_id = target.get("subnet_id")
         subnet = subnets.get(subnet_id, {})
         row = {
             "source_target_private_ip_id": source_id,
             "target_ip_address": ip_address,
+            "numeric_ip_status": "determined" if ip_address else "could_not_be_determined",
+            "lookup_status": lookup_status,
+            "lookup_error": target.get("lookup_error"),
             "source_subnet_id": subnet_id,
             "source_subnet_name": subnet.get("display-name"),
             "source_subnet_cidr": subnet.get("cidr-block"),
             "source_vlan_id": target.get("vlan_id"),
-            "terraform_label": target.get("terraform_label"),
+            "source_vnic_id": target.get("vnic_id"),
+            "subnet_terraform_label": target.get("subnet_terraform_label"),
             "target_status": status,
             "reason": target.get("reason", ""),
             "destination_subnet_id": None,
+            "destination_subnet_name": None,
+            "destination_subnet_cidr": None,
             "destination_target_private_ip_id": None,
-            "resolution": "manual_unresolved" if status == "manual_vlan" else "not_deployed",
+            "resolution": "manual_unresolved",
         }
-        if status == "reserved":
-            label = _required_text(target.get("terraform_label"), "reserved private-IP Terraform label")
-            if outputs is not None:
-                destination_id, entry = _destination_id(reservations, label, "reserved private-IP", source_id)
-                if entry.get("ip_address") != ip_address:
-                    raise ValueError(f"Manual routing handoff: reserved IP address does not match {label!r}.")
-                destination_subnet = _required_text(entry.get("subnet_id"), f"destination subnet for {label!r}")
-                if destination_subnet == subnet_id:
-                    raise ValueError("Manual routing handoff: destination subnet ID equals its source ID.")
-                row.update(destination_target_private_ip_id=destination_id,
-                           destination_subnet_id=destination_subnet, resolution="reserved_attachment_unverified")
-        elif target.get("terraform_label"):
-            raise ValueError("Manual routing handoff: VLAN targets must not claim a Terraform reservation.")
+        label = target.get("subnet_terraform_label")
+        if label and outputs is not None:
+            destination_id, entry = _destination_id(destination_subnets, label, "subnet", subnet_id)
+            name = entry.get("name") or subnet.get("display-name") or label
+            cidr = _required_text(entry.get("cidr"), f"destination subnet CIDR for {label!r}")
+            if subnet.get("cidr-block") and cidr != subnet["cidr-block"]:
+                raise ValueError(f"Manual routing handoff: destination subnet CIDR does not match {label!r}.")
+            row.update(destination_subnet_id=destination_id, destination_subnet_name=name,
+                       destination_subnet_cidr=cidr)
         rows[source_id] = row
     return rows
 
@@ -129,14 +141,16 @@ def _route_rows(rules, route_tables, targets, deployed, private_targets):
         if identity in seen:
             raise ValueError("Manual routing handoff: duplicate source route-table/rule index.")
         seen.add(identity)
-        destination_id = None
+        destination_id, destination_name = None, None
         if deployed:
-            destination_id, _ = _destination_id(route_tables, label, "route-table", source_table_id)
+            destination_id, entry = _destination_id(route_tables, label, "route-table", source_table_id)
+            destination_name = entry.get("name") or rule.get("route_table_name") or label
         row = {
             "source_route_table_name": rule.get("route_table_name", ""),
             "source_route_table_id": source_table_id,
             "terraform_route_table_label": label,
             "destination_route_table_id": destination_id,
+            "destination_route_table_name": destination_name,
             "source_rule_index": index,
             "destination": _required_text(rule.get("destination"), "route destination"),
             "destination_type": _required_text(rule.get("destination_type"), "route destination type"),
@@ -159,39 +173,44 @@ def _render_markdown(report):
     deployed = report["deployment_outputs_available"]
     rules, targets = report["pending_routes"], report["private_ip_targets"]
     lines = ["# Manual routing handoff", "",
-             f"Pending private-IP route rules: **{len(rules)}**. Target addresses: **{len(targets)}**.", "",
+             f"Pending private-IP route rules: **{len(rules)}**. Manual private-IP targets: **{len(targets)}**.", "",
              f"Source region: {_markdown(report['source_region'])}. Destination region: {_markdown(report['destination_region'])}.",
              f"Source snapshot exported at: {_markdown(report['source_exported_at'])}.",
              f"Report generated at: {_markdown(report['generated_at'])}.", ""]
+    unknown = sum(not target["target_ip_address"] for target in targets)
+    if unknown:
+        lines += [f"**Numeric IP addresses could not be determined for {unknown} target(s).** See the lookup errors in Target addresses and confirm these addresses before completing routing.", ""]
     if deployed:
-        lines += ["Destination IDs below come from Terraform outputs. Reserved addresses still need appliance attachment and configuration; this report does not verify their current attachment or readiness.", ""]
+        lines += ["Destination route-table and subnet IDs below come from Terraform outputs. Every private-IP target remains manual and unresolved in this report; destination network creation does not make any target ready.", ""]
     else:
-        lines += ["**NOT DEPLOYED:** destination IDs are unavailable. After a successful apply, the scripts regenerate this report with destination IDs. Source OCIDs are reference information and must never be entered as destination targets.", ""]
+        lines += ["**NOT DEPLOYED:** destination route-table and subnet IDs are unavailable. After a successful apply, the scripts regenerate these network mappings. Source OCIDs are reference information and must never be entered as destination targets.", ""]
     lines += [
+        "No private IPs are automatically allocated, reserved, or attached by these scripts. Numeric source IP discovery is best effort: COULD NOT BE DETERMINED means the lookup did not yield an address. Resolve these entries using the source private-IP OCID and lookup error before selecting a destination address. An OCID, route destination CIDR, or description must not be used to guess the target's numeric IP.", "",
         "## Complete the routing", "",
         "1. Review the source snapshot and the pending rules below. This is an export-time snapshot, not a validation of the current source or destination network.",
-        "2. Deploy the required appliance VMs in the corresponding destination subnets. For each reserved address, use the existing destination private-IP OCID from this report when creating the VM's primary VNIC: supply it as privateIpId in [CreateVnicDetails](https://docs.oracle.com/en-us/iaas/tools/java/latest/com/oracle/bmc/core/model/CreateVnicDetails.Builder.html#privateIpId(java.lang.String)). Do not request a new allocation of the same IPv4 address. Confirm the reservation is attached to the intended appliance.",
-        "3. Resolve every VLAN target manually. No VLAN or private-IP reservation was created for these targets. Provision the required destination network/appliance and record its actual destination private-IP OCID; the source address alone is not a valid destination target.",
+        "2. Resolve missing numeric source IPs and network details first. Deploy the required appliance VMs in the corresponding destination subnets. Manually allocate the intended private IPv4 addresses and assign or attach them to the intended appliance VNICs. Record each newly created destination private-IP OCID in the CSV customer_target_private_ip_id field. This report provides no destination private-IP allocation or OCID for you to reuse.",
+        "3. For VLAN-backed targets, manually provision the required destination VLAN/VMware network and appliance. These scripts do not copy VLANs or allocate their addresses. Verify the destination topology and actual private-IP OCID rather than substituting an unrelated copied subnet.",
         "4. Enable IP forwarding in the appliance operating system and enable skip source/destination check on the routing VNIC. Configure the appliance, security rules, return routes, and next hops needed for the intended traffic.",
         "5. In the destination OCI Console, open each route table using its destination route-table OCID below. Choose Add Route Rules and add each listed rule individually with target type Private IP and its resolved destination private-IP OCID. Copy the destination, destination type, and description. Preserve all existing rules. Do not replace the route table's complete rule list to add these entries.",
         "6. Verify traffic in both directions, then fill the customer completion columns in manual-routing.csv. Keep a separate copy of the completed CSV: regenerating this report overwrites the blank checklist.", "",
-        "Terraform ignores route_rules changes on the owned route tables so that manual additions can remain. Reserved private-IP resources also use lifecycle ignore_changes = all so customer assignments and settings can remain. A successful run.sh check / No changes result does not verify these pending rules, manually edited routes, private-IP assignments or settings, appliance readiness, or connectivity.", "",
+        "Terraform ignores route_rules changes on route tables with deferred private-IP rules so that manual additions can remain. The private IPs and appliances are customer-managed. A successful run.sh check / No changes result does not verify these pending rules, manually edited routes, private-IP assignments or settings, appliance readiness, or connectivity.", "",
         "## Before cleanup", "",
-        "Remove the customer-managed appliances and unassign their reserved private IPs. Remove the manually added private-IP route rules that reference those addresses before running ./cleanup.sh destroy. Those manual route dependencies are outside Terraform's resource graph. Cleanup refuses destruction while a tracked reserved private IP remains attached to a VNIC; it does not remove customer-managed appliances for you. Keep the Terraform state until destruction succeeds. Cleanup destroys the project's owned route tables and any remaining rules in them.", "",
+        "Remove the manually added private-IP route rules, then remove the customer-managed appliances, their VNICs, and private-IP allocations that depend on the copied network before running ./cleanup.sh destroy. These manual resources and dependencies are outside Terraform's resource graph, and the scripts do not remove them for you. Keep the Terraform state until destruction succeeds. Cleanup destroys the project's owned route tables and any remaining rules in them.", "",
         "## Target addresses", "",
-        "| Address | Source private-IP OCID | Source subnet / VLAN | Destination subnet OCID | Destination private-IP OCID | Status |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Numeric source IP | Source private-IP OCID | Source subnet / VLAN | Source VNIC OCID | Destination subnet | Destination private-IP OCID | Lookup status / error | Status |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for target in targets:
-        manual = target["target_status"] == "manual_vlan"
-        source_network = target["source_vlan_id"] if manual else " / ".join(str(x) for x in (target["source_subnet_name"], target["source_subnet_cidr"], target["source_subnet_id"]) if x)
-        values = [target["target_ip_address"], target["source_target_private_ip_id"], source_network,
-                  _display_id(target["destination_subnet_id"], deployed, manual),
-                  _display_id(target["destination_target_private_ip_id"], deployed, manual),
+        source_network = " / ".join(str(x) for x in (target["source_subnet_name"], target["source_subnet_cidr"], target["source_subnet_id"], target["source_vlan_id"]) if x)
+        destination_network = " / ".join(str(x) for x in (target["destination_subnet_name"], target["destination_subnet_cidr"], target["destination_subnet_id"]) if x)
+        destination_network = destination_network or _display_id(None, deployed, not target["subnet_terraform_label"])
+        values = [target["target_ip_address"] or UNKNOWN_IP, target["source_target_private_ip_id"], source_network,
+                  target["source_vnic_id"], destination_network, MANUAL,
+                  target["lookup_status"] + (": " + target["lookup_error"] if target["lookup_error"] else ""),
                   target["resolution"] + (": " + target["reason"] if target["reason"] else "")]
         lines.append("| " + " | ".join(_markdown(v) for v in values) + " |")
     if not targets:
-        lines.append("| None | — | — | — | — | — |")
+        lines.append("| None | — | — | — | — | — | — | — |")
     lines += ["", "## Pending private-IP rules", ""]
     grouped = OrderedDict()
     for rule in rules:
@@ -201,12 +220,13 @@ def _render_markdown(report):
         lines += [f"### {_markdown(first['source_route_table_name'])}", "",
                   f"Source route table: {_markdown(first['source_route_table_id'])}.",
                   f"Destination route table: {_markdown(_display_id(first['destination_route_table_id'], deployed))}.",
+                  f"Destination route-table name: {_markdown(first['destination_route_table_name'] or NOT_DEPLOYED)}.",
                   f"Terraform label: {_markdown(first['terraform_route_table_label'])}.", "",
-                  "| Source rule # | Destination | Destination type | Target address | Destination private-IP OCID | Description |",
-                  "| --- | --- | --- | --- | --- | --- |"]
+                  "| Source rule # | Destination | Destination type | Source private-IP OCID | Numeric source IP | Destination private-IP OCID | Description |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"]
         for row in grouped_rules:
-            values = [row["source_rule_index"], row["destination"], row["destination_type"], row["target_ip_address"],
-                      _display_id(row["destination_target_private_ip_id"], deployed, row["target_status"] == "manual_vlan"), row["description"]]
+            values = [row["source_rule_index"], row["destination"], row["destination_type"], row["source_target_private_ip_id"],
+                      row["target_ip_address"] or UNKNOWN_IP, MANUAL, row["description"]]
             lines.append("| " + " | ".join(_markdown(v) for v in values) + " |")
         lines.append("")
     if not rules:
@@ -263,7 +283,7 @@ def write_handoff(directory, inventory, details, outputs=None):
     excluded = details.get("excluded_drg_routes", [])
     route_tables = _output_map(outputs, "route_tables", bool(pending or excluded))
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_exported_at": inventory.get("exported_at"),
         "source_region": inventory.get("source_region"),
@@ -282,10 +302,11 @@ def write_handoff(directory, inventory, details, outputs=None):
     writer.writeheader()
     for rule in report["pending_routes"]:
         row = dict(rule)
-        manual = rule["target_status"] == "manual_vlan"
         row["destination_route_table_id"] = _display_id(rule["destination_route_table_id"], outputs is not None)
-        row["destination_subnet_id"] = _display_id(rule["destination_subnet_id"], outputs is not None, manual)
-        row["destination_target_private_ip_id"] = _display_id(rule["destination_target_private_ip_id"], outputs is not None, manual)
+        row["destination_route_table_name"] = rule["destination_route_table_name"] or NOT_DEPLOYED
+        row["target_ip_address"] = rule["target_ip_address"] or UNKNOWN_IP
+        row["destination_subnet_id"] = _display_id(rule["destination_subnet_id"], outputs is not None, not rule["subnet_terraform_label"])
+        row["destination_target_private_ip_id"] = MANUAL
         writer.writerow({key: _csv_value(value) for key, value in row.items()})
     rendered = {"manual-routing.json": json.dumps(report, indent=2, sort_keys=True) + "\n",
                 "manual-routing.md": _render_markdown(report),
